@@ -60,6 +60,52 @@ Instruction tile & Tensor Core MMA (e.g., \texttt{mma.m16n8k16}) \\
 \end{tabular}
 \end{center}
 
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[
+        lvl1/.style={draw, thick, fill=blue!5,  minimum width=60mm,
+                     minimum height=45mm, rounded corners=2pt},
+        lvl2/.style={draw, thick, fill=blue!12, minimum width=22mm,
+                     minimum height=15mm, rounded corners=1pt},
+        lvl3/.style={draw, fill=orange!70, minimum width=5.5mm,
+                     minimum height=4.5mm, inner sep=0pt, font=\tiny},
+        lbl/.style={font=\footnotesize}
+    ]
+    % Outer: threadblock (CTA)
+    \node[lvl1]  (cta) at (0, 0) {};
+    \node[lbl, anchor=north west] at (cta.north west)
+         {\bfseries Threadblock tile $B_m\!\times\!B_n$};
+
+    % Inner: 4 warps (warp tile)
+    \foreach \x/\y/\name in {-15/6/W0, 15/6/W1, -15/-12/W2, 15/-12/W3} {
+        \node[lvl2] (\name) at (\x mm, \y mm) {};
+        \node[lbl]  at (\name.north)
+             [anchor=south, yshift=-12mm] {Warp tile};
+    }
+
+    % Inside one warp: MMA instruction fragments 4x3
+    \foreach \c in {0,...,3} {
+        \foreach \r in {0,...,2} {
+            \node[lvl3] at
+                 ($(W0.center) + (\c*6mm - 9mm, \r*5mm - 4.5mm)$) {};
+        }
+    }
+    \node[lbl, font=\scriptsize, anchor=west, xshift=14mm] at (W0.east)
+         {$16{\times}8{\times}16$ MMA};
+
+    % Hardware mapping labels on the right
+    \node[lbl, anchor=west] at (3.6, 2.0)  {$\leftarrow$ CTA / shared memory};
+    \node[lbl, anchor=west] at (3.6, 0.3)  {$\leftarrow$ Warp (32 threads)};
+    \node[lbl, anchor=west] at (3.6,-1.4)  {$\leftarrow$ Tensor-Core MMA};
+    \end{tikzpicture}
+    \caption{CUTLASS three-level tile hierarchy on Ampere/Hopper. A
+             threadblock tile lives in shared memory, is partitioned
+             into four warp tiles, and each warp tile is covered by
+             a grid of instruction-level MMA fragments that issue
+             directly to the Tensor Cores.}
+    \label{fig:cutlass_tile_hierarchy}
+\end{figure}
+
 For input matrices $A \in \mathbb{R}^{M \times K}$ and
 $B \in \mathbb{R}^{K \times N}$, the kernel:
 \begin{enumerate}

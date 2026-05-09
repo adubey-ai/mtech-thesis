@@ -60,12 +60,45 @@ collective at the cluster scale.
 
 \begin{figure}[H]
     \centering
-    \includegraphics[width=0.85\textwidth]{figures/latexlogo.pdf}
-    \caption{Conceptual view of data parallelism: a three-GPU ring
-             topology in which each worker owns a full model replica,
-             consumes a disjoint data slice, and synchronises
-             gradients via a bucketed ring all-reduce that overlaps
-             with the backward pass of later layers.}
+    \begin{tikzpicture}[
+        gpu/.style={draw, rounded corners, minimum width=22mm,
+                    minimum height=14mm, align=center, fill=blue!8,
+                    font=\small},
+        shard/.style={draw, minimum width=6mm, minimum height=4mm,
+                      font=\tiny, inner sep=0pt},
+        arr/.style={-latex, thick, blue!60!black}
+    ]
+    % Three GPUs arranged in a triangle
+    \node[gpu] (g0) at (0, 0)      {GPU 0\\ \tiny replica + $\text{data}_0$};
+    \node[gpu] (g1) at (4, 0)      {GPU 1\\ \tiny replica + $\text{data}_1$};
+    \node[gpu] (g2) at (2, -2.4)   {GPU 2\\ \tiny replica + $\text{data}_2$};
+
+    % Ring arrows (reduce-scatter / all-gather direction)
+    \draw[arr] (g0) to[bend left=15]  node[midway, above, font=\tiny]
+        {shard} (g1);
+    \draw[arr] (g1) to[bend left=15]  node[midway, right, font=\tiny]
+        {shard} (g2);
+    \draw[arr] (g2) to[bend left=15]  node[midway, left, font=\tiny]
+        {shard} (g0);
+
+    % Bucketed-gradient illustration above GPU 0
+    \node[shard, fill=orange!40] (b1) at ($(g0) + (-0.9, 1.4)$) {b$_1$};
+    \node[shard, fill=orange!55, right=0.1mm of b1]             (b2) {b$_2$};
+    \node[shard, fill=orange!70, right=0.1mm of b2]             (b3) {b$_3$};
+    \node[shard, fill=orange!85, right=0.1mm of b3]             (b4) {b$_4$};
+    \draw[decorate, decoration={brace, amplitude=4pt}]
+          (b1.north west) -- (b4.north east)
+          node[midway, above=4pt, font=\tiny]{gradient buckets};
+
+    % Caption-level legend
+    \node[font=\footnotesize\itshape] at (2, -3.4)
+        {Each bucket all-reduces while later layers still back-propagate.};
+    \end{tikzpicture}
+    \caption{Data parallelism on a three-GPU ring. Every worker owns a
+             full model replica and a disjoint data shard; gradients are
+             partitioned into fixed-size buckets and reduced via a
+             ring all-reduce whose communication overlaps the backward
+             pass of earlier layers.}
     \label{fig:data_parallelism}
 \end{figure}
 

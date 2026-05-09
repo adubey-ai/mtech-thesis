@@ -51,6 +51,55 @@ length. In practical chat-style workloads, $\rho_{\text{shared}}$ is
 often between $0.4$ and $0.8$, delivering a near-linear memory saving
 with batch size.
 
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[
+        nd/.style={draw, rounded corners, minimum width=42mm,
+                    minimum height=7mm, font=\scriptsize, align=center,
+                    fill=blue!8},
+        leaf/.style={draw, rounded corners, minimum width=36mm,
+                    minimum height=7mm, font=\scriptsize, align=center,
+                    fill=orange!25},
+        edg/.style={-latex, thick, blue!50!black}
+    ]
+    % Root: shared system prompt
+    \node[nd] (root) at (0, 0)
+         {\textit{root} --- system prompt\\
+          \tiny ``You are a helpful assistant.''};
+    % Branch point 1 -- shared few-shot preamble
+    \node[nd] (mid) at (0, -1.5)
+         {\textit{node} --- few-shot examples\\
+          \tiny Q: ... A: ... Q: ... A: ...};
+    % Three user-specific suffixes
+    \node[leaf] (r1) at (-5.5, -3.2)
+         {req.~A: ``Summarise ...''};
+    \node[leaf] (r2) at (0, -3.2)
+         {req.~B: ``Translate ...''};
+    \node[leaf] (r3) at (5.5, -3.2)
+         {req.~C: ``Generate ...''};
+    \draw[edg] (root) -- (mid);
+    \draw[edg] (mid) -- (r1);
+    \draw[edg] (mid) -- (r2);
+    \draw[edg] (mid) -- (r3);
+    % Shared/unique braces
+    \draw[decorate, decoration={brace, amplitude=4pt, mirror}]
+          (-5, 0.5) -- (-5, -2.1)
+          node[midway, left=5pt, font=\scriptsize, align=center]
+          {shared\\prefix\\(stored\\once)};
+    \draw[decorate, decoration={brace, amplitude=4pt, mirror}]
+          (-5, -2.6) -- (-5, -3.7)
+          node[midway, left=5pt, font=\scriptsize, align=center]
+          {unique\\suffixes};
+    \end{tikzpicture}
+    \caption{RadixAttention prefix tree. The system prompt and the
+             few-shot examples are stored once at interior nodes and
+             referenced by every active request; only the
+             request-specific suffix is duplicated. For chat-style
+             workloads this cuts KV-cache memory by
+             $\rho_{\text{shared}} \in [0.4, 0.8]$.}
+    \label{fig:radix_tree}
+\end{figure}
+
 \subsection{Paged KV Cache}\label{sec:sglang_paged_bg}
 Following the vLLM~\cite{vllm} design, SGLang's KV cache is stored in
 fixed-size \emph{pages}. Each page is a contiguous tensor of shape
@@ -59,6 +108,58 @@ values; a per-request \emph{block table} maps logical token indices
 into physical page indices. Because pages are all of the same size, the
 allocator never fragments, and attention kernels can read the block
 table with a single 32-bit load per block.
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[
+        bt/.style={draw, minimum width=8mm, minimum height=6mm,
+                    font=\tiny, inner sep=1pt},
+        page/.style={draw, minimum width=14mm, minimum height=10mm,
+                     fill=blue!10, font=\tiny, align=center},
+        arr/.style={-latex, thick}
+    ]
+    % Block table (logical -> physical)
+    \node[font=\scriptsize, anchor=south]
+         at (0, 12mm) {\bfseries Block table (request A)};
+    \node[bt] (l0) at (-12mm, 6mm)  {0 $\to$ 7};
+    \node[bt] (l1) at (  0mm, 6mm)  {1 $\to$ 2};
+    \node[bt] (l2) at ( 12mm, 6mm)  {2 $\to$ 4};
+
+    % Physical page pool
+    \node[font=\scriptsize, anchor=south]
+         at (30mm, -10mm) {\bfseries Physical page pool};
+    \foreach \i/\x/\fill in {
+        0/10/blue!4, 1/25/blue!4, 2/40/blue!25, 3/55/blue!4,
+        4/70/blue!25, 5/85/blue!4, 6/100/blue!4, 7/115/blue!25}
+    {
+        \node[page, fill=\fill] (p\i) at (\x mm, -22mm) {page \i};
+    }
+
+    % Arrows from block table to physical pages
+    \draw[arr, red!70!black] (l0.south) to[out=-90, in=90]  (p7.north);
+    \draw[arr, red!70!black] (l1.south) to[out=-90, in=90]  (p2.north);
+    \draw[arr, red!70!black] (l2.south) to[out=-90, in=90]  (p4.north);
+
+    % Request B sharing none but reusing the same pool
+    \node[font=\scriptsize, anchor=south]
+         at (80mm, 12mm) {\bfseries Block table (request B)};
+    \node[bt] (m0) at (68mm, 6mm)  {0 $\to$ 0};
+    \node[bt] (m1) at (80mm, 6mm)  {1 $\to$ 5};
+    \node[bt] (m2) at (92mm, 6mm)  {2 $\to$ 6};
+    \draw[arr, teal!60!black] (m0.south) to[out=-90, in=90]  (p0.north);
+    \draw[arr, teal!60!black] (m1.south) to[out=-90, in=90]  (p5.north);
+    \draw[arr, teal!60!black] (m2.south) to[out=-90, in=90]  (p6.north);
+    \end{tikzpicture}
+    \caption{Paged KV cache layout. Each request owns a block table
+             that maps logical token-block indices (0, 1, 2, \dots)
+             into physical page identifiers drawn from a shared page
+             pool. Because page sizes are fixed at 16 tokens, the
+             allocator never fragments; two requests can interleave
+             in the pool without touching each other's pages, and
+             the attention kernel dereferences physical addresses
+             through a single 32-bit indirection.}
+    \label{fig:paged_kv}
+\end{figure}
 
 \section{Execution Model}\label{sec:sglang_exec}
 A serving step in SGLang consists of four GPU phases:

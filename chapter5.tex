@@ -101,6 +101,74 @@ Each block $(r, c)$ is classified into one of three sets:
           constraint; the block is skipped.
 \end{description}
 
+Figure~\ref{fig:swfa_classify} visualises the three block classes on
+an $8 \times 8$ attention grid for $w_l = w_r = 2$ (so $B_r = B_c = 1$
+position per block for clarity). The inside set $\mathcal{I}$ occupies
+a narrow band around the diagonal, the intersecting set $\mathcal{X}$
+runs along its boundary, and the outside set $\mathcal{O}$ covers the
+remainder of the grid; only blocks in $\mathcal{I} \cup \mathcal{X}$
+enter the kernel loop, and $\mathcal{X}$ alone needs the vectorised
+mask of Algorithm~\ref{alg:swfa_mask}.
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[
+        cell/.style={minimum width=6mm, minimum height=6mm, draw=black!40,
+                     inner sep=0pt, font=\tiny},
+        inside/.style ={cell, fill=green!40},
+        inter/.style  ={cell, fill=orange!50,
+                        pattern=north east lines, pattern color=orange!80!black},
+        outside/.style={cell, fill=gray!12},
+        arr/.style={-latex}
+    ]
+    % 8x8 grid; rows = query index i (top=0, bottom=7),
+    % cols = key index j (left=0, right=7); window |i-j| <= 2
+    \foreach \i in {0,...,7} {
+        \foreach \j in {0,...,7} {
+            \pgfmathtruncatemacro{\diff}{abs(\i - \j)}
+            \ifnum\diff=0
+                \node[inside]  at (\j*6mm, -\i*6mm) {};
+            \else\ifnum\diff=1
+                \node[inside]  at (\j*6mm, -\i*6mm) {};
+            \else\ifnum\diff=2
+                \node[inter]   at (\j*6mm, -\i*6mm) {};
+            \else
+                \node[outside] at (\j*6mm, -\i*6mm) {};
+            \fi\fi\fi
+        }
+    }
+    % axis labels
+    \foreach \j in {0,...,7}
+        \node[font=\tiny] at (\j*6mm, 4mm) {\j};
+    \foreach \i in {0,...,7}
+        \node[font=\tiny] at (-4mm, -\i*6mm) {\i};
+    \node[font=\scriptsize, anchor=south] at (21mm, 8mm) {key index $j$};
+    \node[font=\scriptsize, rotate=90, anchor=south] at (-9mm, -21mm)
+        {query index $i$};
+
+    % Legend
+    \node[inside,  label=right:{\scriptsize $\mathcal{I}$ (inside)}]
+        at (60mm,   0mm) {};
+    \node[inter,   label=right:{\scriptsize $\mathcal{X}$ (intersecting)}]
+        at (60mm,  -8mm) {};
+    \node[outside, label=right:{\scriptsize $\mathcal{O}$ (skipped)}]
+        at (60mm, -16mm) {};
+    \draw[arr, thick] (85mm, -30mm) -- (85mm, -38mm);
+    \node[font=\scriptsize, align=left, anchor=north] at (85mm, -38mm)
+        {only $\mathcal{I}\cup\mathcal{X}$\\ enters the kernel};
+    \end{tikzpicture}
+    \caption{SWFA block classification on an $8 \times 8$ grid with
+             window $w_l = w_r = 2$. Green cells ($\mathcal{I}$)
+             require no masking; hatched orange cells ($\mathcal{X}$)
+             receive the vectorised mask of
+             Algorithm~\ref{alg:swfa_mask}; grey cells
+             ($\mathcal{O}$) are skipped entirely. The skipped
+             fraction grows quadratically with $N/w$, yielding the
+             $1 - 2w/N$ asymptotic ratio proved in
+             Appendix~\ref{app:proofs_block}.}
+    \label{fig:swfa_classify}
+\end{figure}
+
 Algorithm~\ref{alg:swfa_classify} performs the classification by
 examining the block corners.
 
