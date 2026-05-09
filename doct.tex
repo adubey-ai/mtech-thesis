@@ -1,0 +1,79 @@
+\documentclass[mtech,thesis,twoside]{iist}
+\usepackage{times}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.16}
+\usetikzlibrary{shapes,arrows,positioning,matrix}
+\usepackage{subcaption}
+\usepackage{listings}
+\usepackage{float}
+
+\lstset{
+    basicstyle=\ttfamily\footnotesize,
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny
+}
+
+\title{High-Performance Deep Learning Software Stack for Scalable and Efficient LLMs}
+\author{Adarsh Dubey}
+\studentid{SC24M151}
+\advisor{Dr.\ S.\ Sumitra}
+\specialization{Machine Learning and Computing}
+\department{Mathematics}
+\date{\today}
+
+
+%% ---- Document starts here ---- %%
+\begin{document}
+
+%% ---- Make the initial set of pages ---- %%
+\maketitle % Title page
+\makecertificate % Certificate
+\makedeclaration % Declaration
+\makededication % Dedication
+\makeacknowledgements % Acknowledgements
+\makeabstract % Abstract
+\maketableofcontents % Table of contents
+\makelistoffigures % List of figures
+\makelistoftables % List of tables
+\makelistofalgorithms % List of algorithms
+\makeabbreviations % List of abbreviations
+\makenomenclature % Nomenclature (for symbols used)
+
+% Initialize chapter settings; DO NOT comment this line
+\makechaptersettings
+
+
+%% ---- Start chapters here ---- %%
+\input{chapter1}
+\input{chapter2}
+\input{chapter3}
+\input{chapter4}
+\input{chapter5}
+\input{chapter6}
+\input{chapter7}
+\input{chapter8}
+
+
+%% ---- Bibliography addition ----%%
+\makebibsettings
+\bibliographystyle{IEEEtran}
+\bibliography{doct}
+
+%% ---- List of Publications ----%%
+\makepublications
+
+%% ---- Appendices starts here ---- %%
+\makeappendixsettings
+\input{appendixA}
+\input{appendixB}
+
+%% ---- Index starts here ---- %%
+\makeindexsettings
+
+
+\end{document}

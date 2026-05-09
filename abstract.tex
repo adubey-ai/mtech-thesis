@@ -1,0 +1,54 @@
+Training and serving a modern Large Language Model stresses every
+layer of the deep-learning software stack at once: the distributed
+schedule must keep thousands of accelerators coordinated, the kernel
+layer must drive Tensor Cores near peak, the attention algorithm must
+scale sub-quadratically with the context window, and the serving
+runtime must turn the accumulated algorithmic savings into end-user
+throughput. Isolated optimisations at any one of these layers leave
+the gains of the others on the table. This thesis develops, implements,
+and evaluates an end-to-end stack in which the five layers are
+designed to compose, and measures its behaviour on NVIDIA A100 hardware
+across both training and inference workloads.
+
+The work addresses LLM optimisation along five complementary axes.
+\emph{First}, a systematic comparative study of four distributed training
+strategies---Data Parallelism (DP), Distributed Data Parallel (DDP), Fully
+Sharded Data Parallel (FSDP), and DeepSpeed ZeRO-3---is carried out on a
+single-node 8-GPU A100 server with identical workloads, identical
+initialisations, and identical random seeds, isolating the effect of the
+parallelisation strategy itself. \emph{Second}, low-level matrix-multiplication
+kernels are built using NVIDIA CUTLASS 3.x and the CuTe layout algebra,
+covering threadblock/warp/instruction tiling, multi-stage software pipelining,
+Tensor-Core utilisation, and epilogue fusion for bias, activation, and
+residual additions. \emph{Third}, a novel block-sparse \emph{Sliding Window
+Flash Attention} (SWFA) algorithm is developed that augments Flash Attention
+with an explicit block-classification step and a vectorised mask generator.
+Entire $B_r\!\times\!B_c$ blocks that fall outside the attention band are
+skipped rather than merely masked. \emph{Fourth}, GPU kernels inside the
+SGLang serving runtime are engineered for long-context inference, including
+paged KV cache access, fused decode attention, and fused top-$k$/top-$p$
+sampling. \emph{Fifth}, a Triton-based kernel profiling and auto-tuning
+pipeline is assembled that combines CUDA-event timing, roofline analysis,
+Nsight Compute cross-checks, and shape-indexed configuration caching.
+
+Experimental results on an 8-GPU A100-40GB server show that DeepSpeed ZeRO-3
+attains the highest GPU utilisation ($93.8\%$ peak, $65.8\%$ average) and the
+best memory efficiency ($\approx 87.5\%$ reduction per GPU over DP), while
+FSDP provides the best memory/throughput trade-off for medium-scale models.
+The proposed SWFA delivers up to $65.6\%$ reduction in computed attention
+blocks for narrow windows while matching the reference output within
+$10^{-4}$ FP32 tolerance and $10^{-2}$ FP16 tolerance across nineteen
+validation configurations. When combined with DeepSpeed or FSDP on a
+GPT-2-Medium workload with sequence length $2048$, SWFA enables end-to-end
+training throughput improvements of $50$--$59\%$ and energy savings of
+$25$--$29\%$ per epoch. A closed-form expression for the optimal window
+size under an exponential attention-decay cost model is derived, and strict
+convexity of the corresponding loss is proved. The SGLang kernel layer
+achieves a cumulative $2.84\times$ decode-throughput speedup on LLaMA-7B,
+and the Triton profiling pipeline reproduces these numbers independently
+with $<\!3\%$ deviation.
+
+\vspace{4mm}
+\noindent\textbf{Keywords:} Large Language Models, Distributed Training,
+Flash Attention, Sliding-Window Attention, CUTLASS, CuTe, SGLang,
+Triton, GPU Computing, Kernel Profiling, Tensor Cores.

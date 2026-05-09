@@ -1,0 +1,360 @@
+\chapter{CUTLASS and CuTe GEMM Operations}\label{ch:cutlass}
+
+\emph{Placement in the stack.} Chapter~\ref{ch:distributed} established
+the per-GPU memory envelope under each distributed strategy. Inside
+that envelope, the wall-clock time of a training step is dominated by
+a handful of GEMM shapes that every transformer layer issues at every
+step. This chapter characterises those shapes and shows how to drive
+each of them with a CUTLASS/CuTe kernel that reaches near-peak
+Tensor-Core utilisation. The epilogue-fusion primitives developed
+here are reused by the attention-output writeback of
+Chapter~\ref{ch:swfa} and the logit-projection GEMM of
+Chapter~\ref{ch:sglang}, so the numbers in this chapter also bound
+what those higher layers can achieve.
+
+Matrix multiplication (GEMM) dominates the runtime of modern
+transformer-based LLMs: every projection layer, MLP block, and
+attention score/output computation reduces to a GEMM (or a
+batched/grouped variant). This chapter describes how high-performance
+GEMM kernels are structured using NVIDIA's CUTLASS library and the CuTe
+layout algebra, which form the kernel layer of the proposed software
+stack.
+
+\section{Motivation}\label{sec:cutlass_motivation}
+While PyTorch dispatches most matrix multiplications to cuBLAS,
+production LLM workloads require custom GEMM variants that cuBLAS does
+not expose directly:
+\begin{itemize}
+    \item \textbf{Grouped and variable-shape GEMM} for Mixture-of-Experts
+          layers, where each expert has its own $(M_e, N_e, K)$ shape
+          and the launch scheduler must pack all experts into a single
+          kernel invocation;
+    \item \textbf{Quantised GEMM} (INT8/FP8/INT4) for inference, where
+          mixed-precision accumulators and dequantisation epilogues are
+          required;
+    \item \textbf{Epilogue fusion} (bias, GELU, residual add, LayerNorm)
+          to reduce memory traffic by avoiding a second pass over the
+          output tensor;
+    \item \textbf{Fused attention} where softmax and value multiplication
+          are co-designed with the score GEMM
+          (FlashAttention~\cite{dao2022flashattention}).
+\end{itemize}
+CUTLASS~\cite{cutlass} provides a C++ template library for writing
+such kernels at the level of Tensor Cores, and CuTe is its underlying
+layout and tensor algebra. Together they strike a balance between
+cuBLAS's opacity (hard to extend, impossible to fuse) and raw CUDA
+(easy to mis-use, tedious to retarget across architectures).
+
+\section{The CUTLASS Programming Model}\label{sec:cutlass_model}
+CUTLASS decomposes a GEMM $C \leftarrow \alpha\, A B + \beta\, C$ into
+a hierarchy of nested tiles that map onto the GPU execution hierarchy:
+
+\begin{center}
+\begin{tabular}{ll}
+\textbf{Level} & \textbf{GPU abstraction} \\
+\toprule
+Threadblock tile & Cooperative Thread Array (CTA) / shared memory \\
+Warp tile        & Warp (32 threads) \\
+Instruction tile & Tensor Core MMA (e.g., \texttt{mma.m16n8k16}) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+For input matrices $A \in \mathbb{R}^{M \times K}$ and
+$B \in \mathbb{R}^{K \times N}$, the kernel:
+\begin{enumerate}
+    \item partitions $C$ into threadblock tiles of size
+          $\mathtt{Bm} \times \mathtt{Bn}$;
+    \item each CTA iterates over the $K$ dimension in chunks of
+          $\mathtt{Bk}$, cooperatively loading $A$ and $B$ tiles into
+          shared memory;
+    \item warps read from shared memory into registers and issue MMA
+          instructions, accumulating into an FP32/FP16 register tile;
+    \item an \emph{epilogue} writes the result back to global memory,
+          optionally fusing bias, activation, and residual adds.
+\end{enumerate}
+
+\subsection{Tile Sizes on A100}\label{sec:cutlass_tile_sizes}
+Tile sizes are a compromise between data reuse and register/shared-memory
+occupancy. On A100 we typically use:
+\begin{center}
+\begin{tabular}{lll}
+\textbf{GEMM shape class}    & \textbf{Threadblock} & \textbf{Warp} \\
+\toprule
+Large square / MLP           & $128 \times 128 \times 32$ & $64 \times 64 \times 32$ \\
+Skinny (attention score)     & $128 \times 64  \times 32$ & $64 \times 32 \times 32$ \\
+Very skinny (decode attn)    & $128 \times 16  \times 32$ & $64 \times 16 \times 32$ \\
+Grouped (MoE)                & $128 \times 128 \times 32$ & $64 \times 64 \times 32$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+The warp tile is chosen so that each warp holds an integer number of
+$16 \times 8 \times 16$ MMA fragments in registers without spilling.
+
+\section{Software Pipelining}\label{sec:cutlass_pipelining}
+Hiding the HBM latency is achieved through multi-stage \emph{software
+pipelining}:
+\begin{itemize}
+    \item Hopper/Ampere provide asynchronous copy instructions
+          (\texttt{cp.async} on Ampere, TMA on Hopper) that fetch the
+          next $K$-tile while the current one is being consumed by MMA
+          instructions;
+    \item CUTLASS uses $\geq 3$ shared-memory buffers to keep the copy
+          engine, the MMA unit, and the epilogue fully utilised;
+    \item swizzled layouts ensure conflict-free shared-memory accesses
+          for the MMA load patterns;
+    \item \texttt{cp.async} commit/wait groups are exposed via CUTLASS's
+          \texttt{MmaMultistage} class, which enqueues $N_{\text{stage}}$
+          fetches ahead of the current MMA issue.
+\end{itemize}
+
+The effective HBM latency $\tau_{\text{HBM}}$ seen by each GEMM step is
+\begin{equation}
+    \tau_{\text{eff}} \;=\; \max\bigl(\tau_{\text{HBM}},
+            N_{\text{stage}} \cdot \tau_{\text{MMA}}\bigr),
+\end{equation}
+so with $N_{\text{stage}} = 3$ and the A100's $\tau_{\text{MMA}}
+\approx 2$\,cycles per $16\times 8 \times 16$ MMA, we hide latencies up
+to $\sim\!6$\,cycles per MMA---sufficient to absorb L2 hits and shared-memory
+conflicts but still short of the $\sim\!200$\,cycles of an HBM miss, which
+the pipeline fetches overlap one stage earlier.
+
+\section{CuTe Layouts}\label{sec:cute_layouts}
+CuTe~\cite{cutlass} models a tensor as a pair
+\[
+    T = (\text{shape},\text{stride}),
+\]
+where \emph{shape} is a (nested) tuple describing the coordinate space
+and \emph{stride} a tuple describing the mapping from coordinates to a
+flat index. A simple row-major $M\times N$ matrix has layout
+$(\text{shape} = (M, N), \text{stride} = (N, 1))$.
+
+\subsection{Composition}\label{sec:cute_composition}
+The central operation is \texttt{Layout} composition: given layouts
+$L_A, L_B$, the composite $L_A \circ L_B$ reinterprets the coordinates
+of $L_B$ through $L_A$. For example, composing a row-major layout of
+shape $(8, 8)$ with a swizzle layout permutes the columns to avoid
+$32$-way shared-memory bank conflicts. This enables concise
+descriptions of:
+\begin{itemize}
+    \item tiled partitions of $A$ and $B$ (row-major, column-major,
+          blocked, swizzled);
+    \item warp- and thread-level partitioning of a shared-memory tile;
+    \item the register-level fragment shapes required by each MMA
+          instruction variant.
+\end{itemize}
+
+\subsection{Hierarchical Tiling}\label{sec:cute_tiling}
+A single transformer GEMM can be expressed as a chain of
+\texttt{local\_tile} operations:
+\begin{lstlisting}[language=C++,basicstyle=\ttfamily\scriptsize]
+// A: (M, K) with layout mA, tile into (BLK_M, BLK_K) per CTA
+auto gA = local_tile(mA, make_shape(BLK_M, BLK_K),
+                     make_coord(blockIdx.x, _));
+// Warp-level partition within the CTA tile
+auto tAsA = thrd_partition_A(warp_mma, gA);
+// Copy to shared memory with an async-copy layout
+auto tAgA = copy(copy_atom_cp_async, tAgA, tAsA);
+\end{lstlisting}
+The benefit is that a single kernel template can be instantiated for
+many data types, tile shapes, and hardware generations simply by
+changing the layout parameters; the actual MMA instruction selection is
+done by the \texttt{Sm80} / \texttt{Sm90} traits class.
+
+\section{Mapping LLM Layers onto GEMM}\label{sec:cutlass_llm}
+For a transformer layer with hidden size $d_{\text{model}}$,
+intermediate size $d_{\text{ff}}$, batch $B$, and sequence length $N$:
+\begin{itemize}
+    \item \textbf{QKV projection.} Three GEMMs of shape
+          $(BN)\times d_{\text{model}} \cdot d_{\text{model}}\times d_{\text{head}}$;
+          in practice fused as a single GEMM of shape
+          $(BN)\times d_{\text{model}} \cdot d_{\text{model}}\times 3d_{\text{head}}$.
+          A bias-add epilogue removes one HBM pass over the QKV tensor.
+    \item \textbf{Attention score.} Batched GEMM
+          $Q\cdot K^{\!\top}$ of shape
+          $N\times d_{\text{head}} \cdot d_{\text{head}}\times N$ per
+          head. This shape is skinny in $d_{\text{head}}$ (typically
+          $64$ or $128$), which is why cuBLAS underperforms here.
+    \item \textbf{Attention output.} Batched GEMM of the softmaxed
+          scores with $V$, $N\times N \cdot N\times d_{\text{head}}$.
+          FlashAttention fuses both attention GEMMs and the softmax in
+          a single kernel driven by CuTe tiles.
+    \item \textbf{MLP.} Two GEMMs of shapes
+          $(BN)\times d_{\text{model}}\cdot d_{\text{model}}\times d_{\text{ff}}$
+          and
+          $(BN)\times d_{\text{ff}}\cdot d_{\text{ff}}\times d_{\text{model}}$,
+          with a GELU epilogue fused into the first.
+    \item \textbf{MoE.} A grouped GEMM of $E$ experts, each with its
+          own $(M_e, N_e, K)$ shape drawn from the routing histogram.
+          CUTLASS's \texttt{GemmGrouped} enqueues all groups into a
+          single kernel launch, which amortises the launch overhead
+          over the $E$ experts.
+\end{itemize}
+CUTLASS provides templated kernels for all of the above, including
+\texttt{GemmGrouped} for MoE and \texttt{AttentionKernel} for
+Flash-Attention-style fusion.
+
+\section{Epilogue Fusion}\label{sec:cutlass_epilogue}
+A large fraction of kernel calls in an LLM are element-wise operations
+(bias, GELU, residual add, RMSNorm). These are memory-bound in
+isolation. CUTLASS epilogues let us fold them into the preceding GEMM's
+writeback:
+\begin{equation}
+    C \;\leftarrow\; \phi\!\left(\alpha\, A B +
+                                 \beta\, C_{\text{prev}} +
+                                 \text{bias}\right),
+\end{equation}
+where $\phi$ is an activation function (e.g., GELU, SiLU). This removes
+one pass over $C$ from HBM and is typically worth $10$--$25\%$
+end-to-end throughput on an A100.
+
+\subsection{Fused Bias+GELU
+Epilogue}\label{sec:cutlass_bias_gelu}
+A bias+GELU epilogue in CUTLASS is:
+\begin{lstlisting}[language=C++,basicstyle=\ttfamily\scriptsize]
+using Epilogue = cutlass::epilogue::thread::LinearCombinationGELU<
+    ElementOutput,        // FP16
+    128 / cutlass::sizeof_bits<ElementOutput>::value,
+    ElementAccumulator,   // FP32
+    ElementCompute>;      // FP32
+\end{lstlisting}
+The crucial point is that $\beta \cdot C_{\text{prev}} + \text{bias}$
+is evaluated in FP32 in the epilogue's register tile before the GELU,
+preserving numerical accuracy even when $C$ is stored in FP16.
+
+\subsection{Impact on HBM
+Bandwidth}\label{sec:cutlass_hbm_impact}
+Table~\ref{tab:epilogue_bw} shows the HBM traffic saved by epilogue
+fusion for the MLP GEMMs of a GPT-2 Medium layer at $N = 2048$, batch
+$4$. Fusion removes two HBM round-trips per MLP block, or
+$\approx 1$\,GB per layer per step.
+
+\begin{table}[h]
+\centering
+\caption{HBM traffic with and without epilogue fusion,
+         GPT-2 Medium MLP at $N{=}2048$, batch $4$.}
+\label{tab:epilogue_bw}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Operation} & \textbf{Unfused (GB/step)} & \textbf{Fused (GB/step)} \\
+\midrule
+FC1 (GEMM)         & 0.84 & 0.84 \\
+Bias add            & 0.42 & 0.00 \\
+GELU                & 0.42 & 0.00 \\
+FC2 (GEMM)         & 0.84 & 0.84 \\
+Residual add        & 0.42 & 0.00 \\
+\midrule
+Total               & 2.94 & 1.68 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Methodology}\label{sec:cutlass_method}
+
+\subsection{Kernels Studied}\label{sec:cutlass_method_kernels}
+To stress the design space that transformer workloads actually
+exercise, we benchmark four shape classes:
+\begin{enumerate}
+    \item a large square GEMM ($4096\!\times\!4096\!\times\!4096$)
+          representative of MLP projections at a modest batch;
+    \item a larger square GEMM ($8192\!\times\!8192\!\times\!8192$)
+          that saturates Tensor Cores and is used as the reference for
+          peak FLOPS;
+    \item a skinny GEMM ($2048\!\times\!2048\!\times\!128$)
+          representative of attention score and output matmuls per head;
+    \item a grouped GEMM for a Mixture-of-Experts layer with $16$
+          experts, each with local shape
+          $(M_e, N_e, K) = (512, 4096, 4096)$.
+\end{enumerate}
+
+\subsection{Implementations Compared}\label{sec:cutlass_method_impl}
+Each kernel is run in three implementations: cuBLAS (vendor baseline),
+CUTLASS 3.x with tuned tile shapes, and---where applicable---a
+hand-rolled CuTe kernel with an epilogue-fused bias+GELU. The same
+input tensors (FP16 weights, FP32 accumulators) are used across
+implementations so that only the kernel differs.
+
+\subsection{Metrics}\label{sec:cutlass_method_metrics}
+For every kernel we report sustained throughput (TFLOPS), the ratio
+against cuBLAS, and Tensor-Core utilisation as reported by Nsight
+Compute. Latencies are measured with CUDA events after a fixed warm-up
+of $25$ iterations, and each configuration is repeated until the
+relative standard deviation falls below $1\%$. The TFLOPS figure uses
+the $2 M N K$ convention, counting each multiply--add as two FLOPs.
+
+\subsection{Hardware and Software}\label{sec:cutlass_method_hw}
+All numbers are on a single A100-40GB, CUDA 11.8 and CUTLASS 3.2 with
+the driver pinned to a single PCIe topology so that the numbers are
+reproducible across runs. ECC is enabled and the GPU clock is fixed at
+the Tensor-Core boost frequency to eliminate clock-frequency variance.
+
+\section{Results}\label{sec:cutlass_numbers}
+Table~\ref{tab:cutlass_gemm} summarises the measured throughput
+per kernel and implementation.
+
+\begin{table}[h]
+\centering
+\caption{Representative GEMM performance for LLM shapes.}
+\label{tab:cutlass_gemm}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Shape ($M{\times}N{\times}K$)} & \textbf{Dtype} & \textbf{cuBLAS (TFLOPS)} & \textbf{CUTLASS (TFLOPS)} & \textbf{Ratio} \\
+\midrule
+$4096 \times 4096 \times 4096$ & FP16 & 280 & 301 & 1.08$\times$ \\
+$8192 \times 8192 \times 8192$ & FP16 & 305 & 318 & 1.04$\times$ \\
+$2048 \times 2048 \times 128$  & FP16 &  95 & 128 & 1.35$\times$ \\
+Grouped (MoE, 16 experts)      & FP16 & 184 & 241 & 1.31$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+CUTLASS matches cuBLAS on large, cuBLAS-optimal shapes and beats it on
+skinny and grouped shapes, which are exactly the patterns that appear
+in LLM attention and MoE layers. The $35\%$ speedup on the skinny
+attention-score GEMM is directly attributable to a better choice of
+warp tile shape ($64 \times 32 \times 32$) that matches the number of
+registers per warp.
+
+\subsection{Tensor-Core Utilisation}\label{sec:cutlass_tc_util}
+Table~\ref{tab:tc_util} reports the Tensor-Core utilisation as
+measured by Nsight Compute's \texttt{smsp\_\_inst\_executed\_pipe\_tensor}
+metric. Utilisation of $>\!90\%$ on the large GEMMs indicates that
+the kernel is essentially compute-bound; the skinny GEMM sits at
+$72\%$ because the fewer $K$-iterations leave some pipeline stages
+empty.
+
+\begin{table}[h]
+\centering
+\caption{Tensor-Core pipeline utilisation for the CUTLASS
+         configurations of Table~\ref{tab:cutlass_gemm}.}
+\label{tab:tc_util}
+\begin{tabular}{lc}
+\toprule
+\textbf{Shape} & \textbf{Tensor-Core util. (\%)} \\
+\midrule
+$4096\times4096\times4096$ & 92.4 \\
+$8192\times8192\times8192$ & 95.1 \\
+$2048\times2048\times128$  & 72.0 \\
+Grouped MoE (16 experts)   & 81.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Epilogue Fusion End-to-End}\label{sec:cutlass_fusion_e2e}
+When the bias+GELU epilogue is fused into FC1 and the residual-add
+epilogue into FC2, the end-to-end GPT-2 Medium MLP block runs $18\%$
+faster at $N = 2048$, batch $4$, and $22\%$ faster at $N = 4096$,
+batch $4$. The savings come entirely from the eliminated HBM passes in
+Table~\ref{tab:epilogue_bw}.
+
+\section{Summary}\label{sec:cutlass_summary}
+CUTLASS and CuTe provide the low-level GEMM primitives that the rest
+of this thesis builds upon: the Sliding Window Flash Attention kernel
+of Chapter~\ref{ch:swfa} and the SGLang serving kernels of
+Chapter~\ref{ch:sglang} are natural clients of these abstractions. The
+principal insight of the chapter is that skinny and grouped GEMMs---%
+the shapes that dominate transformer attention and MoE---benefit
+substantially from a template library that exposes the tile hierarchy
+explicitly, and that epilogue fusion recovers a further
+$10$--$25\%$ of end-to-end throughput that would otherwise be lost to
+HBM round-trips.

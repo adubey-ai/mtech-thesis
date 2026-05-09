@@ -1,0 +1,27 @@
+# LaTeX build artefacts
+*.aux
+*.log
+*.toc
+*.lof
+*.lot
+*.loa
+*.out
+*.fls
+*.fdb_latexmk
+*.bbl
+*.blg
+*.idx
+*.ilg
+*.ind
+*.xml
+*.bcf
+*-blx.bib
+*.synctex.gz
+
+# Pandoc-generated outputs (build from source when needed)
+doct.docx
+doct.pdf
+
+# OS noise
+.DS_Store
+Thumbs.db

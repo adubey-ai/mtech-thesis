@@ -1,0 +1,465 @@
+\chapter{Literature Review}\label{ch:litreview}
+
+This chapter surveys the prior work that underpins the five technical
+pillars of the thesis: distributed training, high-performance GEMM
+libraries, efficient attention mechanisms, LLM serving runtimes, and
+GPU-kernel profiling. The aim is to establish where the state of the art
+currently stands, to highlight the open gaps the thesis attempts to
+close, and to introduce the vocabulary used throughout the remaining
+chapters. The chapter follows the same top-down order as the stack
+itself (Fig.~\ref{fig:intro_stack}): we start at the outermost level
+of the training schedule and progressively descend to kernel-level
+profiling.
+
+\paragraph{How to read this chapter.} Sections~\ref{sec:lit_dist}
+through~\ref{sec:lit_profiling} each follow the same internal
+structure: a brief restatement of the classical problem, a survey of
+the principal systems or papers that address it, and a pointer
+forward to the chapter of the thesis that reopens the question. The
+final section (Section~\ref{sec:lit_gap}) collects the open gaps
+into a single positioning statement that is referred back to in the
+contributions list of Section~\ref{sec:intro_contributions}. Readers
+familiar with a given sub-area can skip directly to the forward
+pointer in its section.
+
+\section{Distributed Training of Deep Neural Networks}\label{sec:lit_dist}
+
+\subsection{Data Parallelism and Its Refinements}\label{sec:lit_dp}
+Data parallelism (DP) is the oldest and conceptually simplest distributed
+training strategy: every worker holds a replica of the model, processes a
+disjoint shard of the mini-batch, and participates in an all-reduce that
+synchronises gradients across replicas. Its main limitation is memory
+duplication and the communication cost of synchronising a full gradient
+tensor on every step. Ott~et~al.~\cite{ott2018fairseq} showed that
+large-batch training with well-tuned learning-rate schedules recovers
+single-device accuracy while spreading the work across many GPUs, and
+You~et~al.~\cite{you2020lars} introduced the LARS/LAMB optimisers that
+stabilise very large batches.
+
+The PyTorch Distributed Data Parallel path~\cite{li2020pytorch}
+is the engineering answer to this. It groups gradients into
+communication \emph{buckets} whose size matches the granularity of
+the backward-pass computation, so that each bucket finishes its
+reduction while the next layer is still computing; it runs those
+reductions on a dedicated CUDA stream that is hooked into the
+autograd engine; and it dispatches them through a ring topology
+whose bandwidth consumption per worker is asymptotically independent
+of the world size. The classical $2(P-1)/P$ bandwidth factor of a
+ring all-reduce is a consequence of the two-phase
+reduce-scatter/all-gather structure, and the latency term that scales
+with the number of hops becomes negligible once the parameter tensor
+is larger than a few tens of megabytes, which is always the case
+for the models in this thesis. DDP is therefore the industry
+baseline for single-node multi-GPU training and the reference point
+against which FSDP and ZeRO must justify their extra collectives.
+
+\subsection{Model Parallelism and Pipeline Parallelism}\label{sec:lit_mp}
+As models outgrow a single accelerator, model parallelism becomes
+necessary. Shoeybi~et~al.~\cite{shoeybi2019megatron} introduced
+Megatron-LM, a tensor-parallel framework that shards attention and MLP
+layers across devices using dimension-wise splits, preserving a single
+training step as a sequence of all-reduces. Narayanan et
+al.~\cite{narayanan2021efficient} extended this to trillion-parameter
+scale by combining tensor parallelism with pipeline parallelism on a
+$3072$-GPU cluster, achieving $52\%$ of peak.
+
+Pipeline parallelism splits the model into sequential stages executed on
+different devices; its main challenge is the \emph{pipeline bubble}
+produced by warm-up and cool-down phases. GPipe~\cite{huang2019gpipe}
+reduces the bubble by processing multiple micro-batches concurrently and
+pays a memory overhead proportional to the number of micro-batches in
+flight. PipeDream~\cite{harlap2018pipedream} interleaves forward and
+backward passes (the $1\mathrm{F}1\mathrm{B}$ schedule) and recovers
+near-linear scaling at the price of mild gradient staleness.
+
+\subsection{Sharded Data Parallelism: FSDP and ZeRO}\label{sec:lit_shard}
+Fully Sharded Data Parallel (FSDP)~\cite{zhao2023pytorch} shards
+parameters, gradients, and optimiser state across the data-parallel
+group. Parameters are all-gathered just before a layer's forward or
+backward pass and re-sharded immediately afterwards, keeping peak
+per-GPU memory independent of the model size. The engineering effort
+in FSDP is in the \emph{unit of sharding}: too coarse and the all-gather
+traffic becomes bursty, too fine and the launch overhead dominates.
+PyTorch FSDP-2 introduces the \texttt{FlatParameter} abstraction that
+collapses each transformer block into a single sharded tensor, tuning
+the unit of communication to the unit of compute.
+
+The DeepSpeed ZeRO family~\cite{rajbhandari2019zero, rajbhandari2021zero}
+groups the sharding question into three levels that each reclaim
+memory from a different part of the training state. The first level
+keeps one copy of the parameters on every device but shards the
+Adam moments, which is where most of the memory sits once the
+master FP32 copy is accounted for. The second level additionally
+shards the gradients that feed into those moments, so that a worker
+never materialises the full gradient tensor except during the
+reduce-scatter that produces its own shard. The third level
+shards the parameters themselves: each worker is responsible for a
+slice of the model and must gather the other slices on demand
+before every forward and backward pass. The third level reaches the
+information-theoretic lower bound on per-worker memory, and in
+exchange it pays two extra collectives per layer---an all-gather
+before compute and a reduce-scatter afterwards---both of which must
+be overlapped with compute to avoid a regression on step time.
+ZeRO-Infinity~\cite{rajbhandari2021zero} adds NVMe offloading, enabling
+trillion-parameter training on $512$-GPU systems. DeepSpeed itself
+\cite{rasley2020deepspeed, rajbhandari2022deepspeed} packages ZeRO with
+gradient compression, loss scaling, and Mixture-of-Experts support, and
+is widely used in production LLM training pipelines.
+
+Korthikanti~et~al.~\cite{korthikanti2022activation} showed that for
+models beyond $\sim 10$B parameters, the \emph{activation} memory
+becomes the binding constraint rather than the parameter memory, and
+introduced selective activation recomputation---an idea originally
+developed by Chen~et~al.~\cite{chen2016training} for smaller models.
+Most public comparisons of DP/DDP/FSDP/ZeRO report individual results
+in isolation rather than a controlled, single-node study;
+Chapter~\ref{ch:distributed} addresses that gap with a common model,
+dataset, and hardware configuration.
+
+\subsection{Mixed Precision and Optimiser
+Considerations}\label{sec:lit_mp_amp}
+Micikevicius~et~al.~\cite{micikevicius2018amp} showed that training in
+FP16 with a master FP32 copy of the weights and dynamic loss scaling
+preserves accuracy while halving memory usage and doubling Tensor-Core
+throughput. BF16 on A100 and FP8 on H100~\cite{nvidia_hopper} extend this
+further at the cost of a small numerical gap that has to be managed at
+the layer level (usually through careful placement of the accumulator
+precision).
+
+\subsection{Collective Communication Libraries}\label{sec:lit_nccl}
+Distributed training performance hinges on the collective library
+underneath. NCCL~\cite{nccl} implements ring and tree all-reduce on top
+of NVLink/NVSwitch/InfiniBand, with message-size-aware algorithm
+selection. Castell{\'o}~et~al.~\cite{castello2021accelerating} describe
+pipelined all-reduce on top of MPI, showing that overlapping reduce and
+broadcast stages with intra-node copies yields up to $30\%$ end-to-end
+speedup on commodity clusters.
+
+\section{High-Performance GPU Kernels and GEMM Libraries}\label{sec:lit_gemm}
+
+Matrix multiplication is the performance-critical primitive of every
+transformer layer. Vendor libraries such as cuBLAS and cuBLASLt expose
+highly tuned dense GEMM kernels but offer limited support for the
+non-standard shapes, fused epilogues, and grouped variants that modern
+LLMs require. CUTLASS~\cite{cutlass} provides a C++ template library of
+GEMM building blocks with explicit control over tile sizes, software
+pipelining, and Tensor-Core instructions. Its CuTe sublibrary generalises
+layout algebra so that a single template can be instantiated for many
+hardware generations and data types.
+
+\subsection{From cuBLAS to CUTLASS}\label{sec:lit_cublas_cutlass}
+cuBLAS is a closed-source library optimised by NVIDIA for a small number
+of canonical GEMM shapes and precisions. For the skinny, batched, or
+grouped GEMMs that dominate LLM attention and MoE layers, cuBLAS
+frequently dispatches to a generic kernel that leaves Tensor Cores
+under-utilised. CUTLASS exposes the three-level tile hierarchy
+(threadblock, warp, instruction) explicitly so that a user can match
+the kernel to their actual shape; it also composes with epilogue
+templates that fuse bias, activation, and residual-add operations into
+the writeback of the main GEMM.
+
+\subsection{Triton and the DSL
+Approach}\label{sec:lit_triton_dsl}
+Triton~\cite{tillet2019triton} takes a different approach: it is a
+Python-embedded DSL that exposes the tile abstraction directly, letting
+kernel authors trade a modest fraction of peak throughput for much
+faster iteration cycles. Recent work in
+FlashAttention-2~\cite{dao2023flashattention2} and
+FlashAttention-3~\cite{dao2024flashattention3} builds directly on these
+primitives, and much of the serving stack discussed later in this
+thesis is written in Triton. The literature contains relatively few
+treatments that compare the two ecosystems on the exact kernels
+produced by a transformer forward pass; this is one of the gaps that
+Chapters~\ref{ch:cutlass} and~\ref{ch:triton} aim to narrow.
+
+\subsection{Hardware-Specific Primitives}\label{sec:lit_hw}
+The A100 whitepaper~\cite{nvidia_a100} documents the third-generation
+Tensor Cores with $312$\,TFLOPS of FP16, the new \texttt{mma.m16n8k16}
+and \texttt{mma.m16n8k8} instructions, and the \texttt{cp.async}
+asynchronous copy path. The H100 whitepaper~\cite{nvidia_hopper}
+introduces the Tensor Memory Accelerator (TMA), fourth-generation Tensor
+Cores, a dedicated transformer engine with FP8 support, and DSMEM for
+threadblock-cluster cooperation. CUTLASS 3.x abstracts these differences
+behind a layout-algebra interface so that the same kernel template can
+target multiple architectures with different \texttt{Sm}-specific
+instantiations.
+
+\section{Efficient Attention Mechanisms}\label{sec:lit_attn}
+
+\subsection{Exact Attention Acceleration}\label{sec:lit_flashattn}
+The central insight of the Flash Attention family is that the full
+$N \times N$ score matrix is an intermediate that need not reside in
+HBM at any point: if queries are streamed against keys and values in
+matching tiles, and the running row-max and row-sum are carried across
+tiles via a correction factor, the output can be produced without ever
+writing the dense scores back to global memory. The original
+kernel~\cite{dao2022flashattention} uses this rearrangement to reduce
+the memory footprint from $\mathcal{O}(N^2)$ to $\mathcal{O}(N)$ while
+remaining bit-equivalent to the dense reference up to the order of
+floating-point additions. FlashAttention-2~\cite{dao2023flashattention2}
+re-balances the work along the sequence axis so that the occupancy of
+an A100 does not drop at long sequence lengths, and
+FlashAttention-3~\cite{dao2024flashattention3} rewrites the same idea
+against the Hopper WGMMA and FP8 pipelines, taking advantage of
+asynchrony between the copy engine and the Tensor-Core pipeline. In
+the space covered by this thesis, these three kernels are treated as
+the reference point that any new attention kernel must match on
+correctness and must beat on either speed or sparsity.
+
+\subsection{Sparse and Local Attention}\label{sec:lit_sparse}
+A second line of work attacks the quadratic cost at the definitional
+level, by dropping the dependence between distant tokens. The Sparse
+Transformer~\cite{child2019generating} was the first widely-adopted
+example: it composes a strided pattern with a fixed pattern to reach
+sequence lengths in the tens of thousands while keeping the per-layer
+cost linear in $N$. Longformer~\cite{beltagy2020longformer} simplifies
+this to a local sliding window augmented with a handful of global
+tokens for task-specific anchoring, and BigBird~\cite{zaheer2020bigbird}
+restores the universal-approximator property by layering a random
+long-range term on top of the window. The current open-weight
+generation of models has converged on the simplest of these patterns:
+a plain sliding window of a few thousand positions, on the empirical
+observation that the softmax weight outside that radius is already
+indistinguishable from numerical noise. This architectural
+convergence is what makes a window-aware kernel commercially
+relevant, not merely academically interesting.
+
+Linearised attention
+(Performer~\cite{choromanski2020performer},
+Linformer~\cite{wang2020linformer}) and
+low-rank approximations
+(Reformer~\cite{kitaev2020reformer}) take the complementary approach of
+replacing the full attention by a cheaper-to-compute surrogate; they
+trade asymptotic complexity for a small accuracy gap and have seen
+modest adoption in production. The exact sliding-window path pursued in
+Chapter~\ref{ch:swfa} keeps the attention numerics unchanged and
+exploits the sparsity at the kernel level rather than in the
+mathematical definition.
+
+\subsection{Kernel-Level Fusions for Attention}\label{sec:lit_fused}
+Several kernel-level variants of attention target inference
+specifically. PagedAttention~\cite{vllm} stores the key--value cache in
+fixed-size pages so that the attention kernel can address it with
+32-bit page indices, eliminating fragmentation.
+RadixAttention~\cite{sglang} extends this to a radix tree so that shared
+prompt prefixes are stored only once. Multi-Query
+Attention (MQA)~\cite{shazeer2019mqa} and Grouped-Query Attention
+(GQA)~\cite{ainslie2023gqa} reduce the KV cache by a factor of $H$ (the
+number of heads) or $H/G$ (the number of groups), which directly
+reduces the memory bandwidth required during decode. These designs
+change the memory layout seen by the attention kernel and therefore
+have direct consequences for kernel scheduling, discussed in
+Chapter~\ref{ch:sglang}.
+
+\subsection{Positional Encodings for Long
+Context}\label{sec:lit_rope}
+Long-context attention cannot be evaluated in isolation from the
+positional encoding: rotary position embeddings
+(RoPE)~\cite{su2021rope} extend cleanly to sequences longer than those
+seen in training, and combined with dynamic NTK-aware scaling they
+allow a model trained at $N = 4{,}096$ to be served at $N = 32{,}768$
+with graceful degradation. SWFA composes with RoPE without
+modification, because the window constraint acts purely on the
+attention score matrix.
+
+\subsection{Block Sparsity as a Design
+Pattern}\label{sec:lit_block_sparsity}
+A recurring theme across the above families is that \emph{block-level}
+sparsity is practical while \emph{element-level} sparsity is not. The
+reason is structural: modern Tensor Cores issue the same
+$16 \times 8 \times 16$ MMA instruction regardless of how many
+individual elements are zero, so element-level sparsity delivers no
+wall-clock saving unless the hardware itself supports a structured
+pruning format. Block sparsity, in contrast, maps cleanly onto the
+threadblock-level tiling of CUTLASS/CuTe: a block that is classified
+as \enquote{skip} simply does not enter the loop nest of
+Algorithm~\ref{alg:swfa}. This observation is what allows SWFA to
+deliver measurable speedups without a custom Tensor-Core ISA; the
+same pattern has been applied to strided sparsity in Sparse
+Transformer~\cite{child2019generating} and to the global-plus-random
+mask of BigBird~\cite{zaheer2020bigbird}, but---to our
+knowledge---never combined with the online softmax of Flash Attention
+inside a single published kernel.
+
+\section{LLM Serving Systems and KV-Cache Management}\label{sec:lit_serving}
+
+Serving workloads differ qualitatively from training: requests arrive
+asynchronously, prompts share large prefixes, and the decode phase is
+memory-bound rather than compute-bound. A single chat request may
+contribute a few hundred tokens of unique suffix on top of a
+multi-thousand-token system prompt shared with every other concurrent
+request; the serving runtime that fails to exploit that prefix
+sharing pays a linear cost in the shared part.
+vLLM~\cite{vllm} was the first widely-used runtime to treat the KV
+cache as a pool of fixed-size pages and to introduce \emph{continuous
+batching}, in which new requests can join the batch at every decode
+step. SGLang~\cite{sglang} builds on this with RadixAttention and a
+structured-generation language that compiles complex prompt flows into
+a scheduled dataflow of kernel calls. Both systems stress the kernel
+layer in new ways---RadixAttention changes the access pattern of the
+attention kernel, and continuous batching produces many small, tightly
+scheduled kernel launches.
+
+The kernel-level contributions of Chapter~\ref{ch:sglang} are placed
+in this lineage. In contrast to the system-level papers that describe
+vLLM and SGLang, this thesis focuses on the \emph{individual kernels}
+that the runtime dispatches to, and reports their performance in
+isolation so that improvements can be attributed to specific kernel
+changes.
+
+\section{GPU Kernel Profiling and Auto-tuning}\label{sec:lit_profiling}
+
+Kernel-level performance analysis has historically drawn on two
+complementary traditions. Vendor metric collectors---Nsight
+Compute~\cite{nsight} on NVIDIA silicon, and \texttt{nvprof} before
+it---expose occupancy, cache hit rates, and the instruction-mix
+breakdown needed to localise a stall to a specific hardware unit.
+The roofline model~\cite{williams2009roofline} complements this with
+an analytical upper bound: the sustained throughput of a kernel is
+capped by either the peak compute rate or by the product of its
+arithmetic intensity and the memory bandwidth, whichever comes
+first. For an A100 operating in FP16 ($312$\,TFLOPS of Tensor-Core
+throughput against $1{,}555$\,GB/s of HBM2e bandwidth), the two caps
+cross at an intensity of roughly $200$\,FLOP per byte. Dense
+square GEMMs comfortably exceed that threshold and therefore live
+on the compute ceiling; attention-score GEMMs with small
+$d_{\text{head}}$, and single-query decode kernels, sit well below
+it and are bandwidth-limited by design.
+
+Triton's built-in \texttt{autotune} mechanism iterates over block
+shapes, warp counts, and pipeline depths and caches the best
+configuration per input shape. CUTLASS has a similar
+\texttt{GemmUniversal} configuration enumerator and an external
+\texttt{cutlass\_profiler} binary. The open literature contains many
+single-kernel auto-tuning studies but few end-to-end pipelines that
+cross-validate Triton, CUTLASS, and Torch-inductor on the same LLM
+kernels. Chapter~\ref{ch:triton} presents such a pipeline.
+
+\section{Energy and Carbon Considerations}\label{sec:lit_energy}
+Patterson~et~al.~\cite{patterson2021carbon} estimate that training GPT-3
+emitted about $552$\,t\,CO\textsubscript{2}e, equivalent to
+$115$ transatlantic passenger flights, and that the serving cost
+accumulated over the deployment lifetime can exceed the one-off training
+cost. This motivates an energy-aware comparison of distributed training
+strategies (Chapter~\ref{ch:distributed}) and an explicit accounting of
+kWh per epoch, which appears in our results tables alongside the
+traditional throughput and memory metrics.
+
+\section{Cross-Cutting Concerns}\label{sec:lit_cross}
+
+Three concerns cut across the five layers above and therefore deserve
+a brief treatment before the positioning section.
+
+\subsection{Numerical Precision at
+Scale}\label{sec:lit_precision}
+Mixed-precision training (Section~\ref{sec:lit_mp_amp}) is only safe
+if every kernel in the stack agrees on the accumulator precision.
+CUTLASS and Triton both allow the accumulator to be specified
+independently of the input data type, and the distributed-training
+frameworks (DDP, FSDP, DeepSpeed) expose a \texttt{reduce\_dtype} that
+keeps the cross-device reduction in FP32 even when the parameters live
+in FP16. This thesis follows the same convention at every layer: FP16
+or BF16 inputs, FP32 accumulators, and FP32 reductions. The numerical
+validation in Chapter~\ref{ch:swfa} confirms that this is sufficient
+to match a vanilla PyTorch reference within
+$10^{-4}$ FP32 and $10^{-2}$ FP16 tolerance. Looking forward, FP8 on
+Hopper~\cite{nvidia_hopper} and emerging FP4/NVFP6 formats will push
+the accumulator-precision question into the epilogue rather than the
+main MMA loop; the CUTLASS epilogue templates of
+Chapter~\ref{ch:cutlass} are structurally ready for this transition,
+though the shape-indexed auto-tune cache of
+Chapter~\ref{ch:triton} needs widening to include the
+accumulator-precision axis.
+
+\subsection{Reproducibility in a Non-Deterministic
+Stack}\label{sec:lit_repro}
+Every layer of the stack is non-deterministic by default: PyTorch's
+own reduction kernels choose the reduction order based on the launch
+configuration, NCCL selects between ring and tree algorithms based on
+message size, and continuous batching in SGLang produces
+launch orders that depend on the live request mix. A literal
+bit-level reproduction is therefore impossible. This thesis instead
+follows the convention of \emph{statistical} reproducibility: fixed
+random seeds, fixed hardware, and a reported relative standard
+deviation below $1\%$ on every measured configuration. Where a
+deterministic path exists---most notably for the numerical-accuracy
+validation of SWFA (Chapter~\ref{ch:swfa})---it is used, and the
+deterministic output is compared bit-exactly to the PyTorch reference.
+
+\subsection{Energy as a First-Class
+Metric}\label{sec:lit_energy_metric}
+Following Patterson~et~al.~\cite{patterson2021carbon}, this thesis
+reports energy per epoch alongside throughput at every layer where it
+can be measured. The argument for doing so is not primarily
+environmental: at data-centre scale, energy is simply a proxy for
+the sum of idle-time, memory-stall, and under-utilised-compute costs,
+none of which show up in a raw throughput number. A training run
+that finishes in $8$ hours but consumes $20\%$ more energy than
+necessary has $20\%$ of wasted work sitting somewhere in the stack,
+and knowing which layer contains that waste is the purpose of a
+controlled comparison (Chapter~\ref{ch:distributed}) plus a
+cross-validating profiling pipeline (Chapter~\ref{ch:triton}).
+
+\section{Positioning of This Thesis}\label{sec:lit_gap}
+
+The picture that emerges from the literature is one of rapid progress
+in each of the five areas---distributed training, GEMM libraries,
+efficient attention, serving runtimes, and kernel profiling---but with
+limited integration across them. Distributed-training studies rarely
+report kernel-level measurements; attention-kernel papers are usually
+benchmarked in isolation; and serving-system papers tend to treat the
+attention kernel as a fixed dependency. This thesis takes the
+complementary view that the training, kernel, attention, serving, and
+profiling layers must be co-designed:
+\begin{itemize}
+    \item a sliding-window attention kernel only pays off if the serving
+          runtime exposes the window to it, and if the underlying GEMM
+          library can efficiently launch the resulting batched and
+          sparse tiles;
+    \item a distributed-training schedule only reaches peak efficiency
+          if the underlying GEMM and attention kernels are well-tuned;
+          unused Tensor Cores at the kernel level are simply inherited
+          at every scale of parallelism;
+    \item a profiling pipeline that reports the same metric across
+          Triton, CUTLASS, and PyTorch is the only way to reason
+          quantitatively about these interactions without being
+          mis-led by per-library calibration differences.
+\end{itemize}
+Chapters~\ref{ch:distributed}--\ref{ch:triton} develop these layers in
+turn and show in the evaluation that they compose.
+
+Table~\ref{tab:lit_summary} summarises the principal systems cited in
+this chapter, together with the layer of the stack at which they
+intervene and the primary axis of the contribution.
+
+\begin{table}[h]
+\centering
+\caption{Principal prior systems organised by stack layer.}
+\label{tab:lit_summary}
+\begin{tabular}{lllc}
+\toprule
+\textbf{System} & \textbf{Layer} & \textbf{Primary axis} & \textbf{Reference} \\
+\midrule
+DDP              & Distributed & Bucketed all-reduce  & \cite{li2020pytorch} \\
+Megatron-LM      & Distributed & Tensor parallelism    & \cite{shoeybi2019megatron} \\
+GPipe            & Distributed & Pipeline parallelism  & \cite{huang2019gpipe} \\
+PipeDream        & Distributed & 1F1B pipeline         & \cite{harlap2018pipedream} \\
+FSDP             & Distributed & Parameter sharding    & \cite{zhao2023pytorch} \\
+ZeRO             & Distributed & Three-stage sharding  & \cite{rajbhandari2019zero} \\
+ZeRO-Infinity    & Distributed & NVMe offload          & \cite{rajbhandari2021zero} \\
+DeepSpeed        & Distributed & System integration    & \cite{rasley2020deepspeed} \\
+CUTLASS          & Kernel      & Template GEMM         & \cite{cutlass} \\
+Triton           & Kernel      & Tile-level DSL        & \cite{tillet2019triton} \\
+Flash Attention  & Attention   & Online softmax        & \cite{dao2022flashattention} \\
+FlashAttention-2 & Attention   & Work partitioning     & \cite{dao2023flashattention2} \\
+FlashAttention-3 & Attention   & WGMMA + FP8           & \cite{dao2024flashattention3} \\
+Longformer       & Attention   & Local + global        & \cite{beltagy2020longformer} \\
+BigBird          & Attention   & Random + local        & \cite{zaheer2020bigbird} \\
+MQA / GQA        & Attention   & Head reduction        & \cite{shazeer2019mqa,ainslie2023gqa} \\
+vLLM             & Serving     & Paged KV cache        & \cite{vllm} \\
+SGLang           & Serving     & Radix KV + DSL        & \cite{sglang} \\
+Nsight Compute   & Profiling   & Metric collection     & \cite{nsight} \\
+Roofline         & Profiling   & Analytical model      & \cite{williams2009roofline} \\
+\bottomrule
+\end{tabular}
+\end{table}

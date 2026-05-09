@@ -1,0 +1,170 @@
+\chapter{Conclusions and Future Work}\label{ch:conclusion}
+
+\section{Summary of Contributions}\label{sec:concl_summary}
+This thesis developed and evaluated a modular high-performance
+software stack for scalable and efficient Large Language Models. The
+principal contributions are:
+\begin{enumerate}
+    \item A comparative study of four distributed training strategies
+          on an 8-GPU server, with detailed utilisation, memory, and
+          energy measurements (Chapter~\ref{ch:distributed}).
+          DeepSpeed ZeRO-3 attained the highest peak GPU utilisation
+          ($93.8\%$) and the best per-epoch energy ($22\%$ over DP);
+          FSDP matched ZeRO-3 on memory efficiency while remaining
+          simpler to deploy.
+    \item A treatment of CUTLASS/CuTe GEMM pipelines and their
+          mapping onto transformer layers
+          (Chapter~\ref{ch:cutlass}). CUTLASS matched cuBLAS on large
+          square GEMMs and outperformed it by $35\%$ on skinny
+          attention shapes and $31\%$ on grouped MoE shapes; epilogue
+          fusion saved an additional $10$--$25\%$ of end-to-end HBM
+          traffic.
+    \item A novel Sliding Window Flash Attention algorithm with block
+          classification, vectorised mask generation, up to $65.6\%$
+          block skipping, and a closed-form optimal-window formula
+          whose loss is strictly convex
+          (Chapter~\ref{ch:swfa}). SWFA enabled $50$--$59\%$
+          throughput improvement on GPT-2-Medium training and
+          achieved sub-$10^{-4}$ FP32 accuracy over $19$ validation
+          configurations.
+    \item Kernel-level optimisations inside the SGLang serving
+          runtime for long-context inference
+          (Chapter~\ref{ch:sglang}), delivering a cumulative
+          $2.84\times$ decode-throughput speedup on LLaMA-7B with
+          $w = 4096$ while keeping p99 latency under $30$\,ms at
+          batch $64$.
+    \item A Triton-based profiling and auto-tuning pipeline
+          (Chapter~\ref{ch:triton}) that reproduced the CUTLASS
+          numbers to within $3\%$, providing an independent
+          cross-check on the SWFA and SGLang measurements.
+\end{enumerate}
+The end-to-end evaluation shows a $50$--$59\%$ throughput improvement
+and $25$--$29\%$ energy reduction for a GPT-2-Medium workload when
+SWFA is combined with DeepSpeed or FSDP, demonstrating that the
+individual layers of the stack compose rather than compete.
+
+\section{Lessons Learned}\label{sec:concl_lessons}
+
+\subsection{Layering Wins Over Point Optimisation}\label{sec:concl_layering}
+No single optimisation in this thesis delivers the end-to-end result
+in isolation: the $59\%$ training throughput gain requires the SWFA
+kernel, the sharded training schedule, and the epilogue-fused GEMMs
+to cooperate. The SGLang chapter makes the same point from a
+different angle---the $2.84\times$ serving speedup is the product of
+four independent kernels, each responsible for a distinct bottleneck.
+
+\subsection{Block-Level Sparsity Is Practical}\label{sec:concl_sparsity}
+Sparsity at the element level is hard to exploit on modern Tensor
+Cores: the $16 \times 8 \times 16$ MMA instructions issue whole dense
+tiles. Block-level sparsity, in contrast, integrates cleanly because
+each tile is either fully present or fully absent. SWFA illustrates
+this at the scale of the attention matrix, and the same pattern should
+extend to other structured sparsity families (strided, blocksparse,
+BigBird).
+
+\subsection{Profiling Is a First-Class
+Deliverable}\label{sec:concl_profiling}
+Having a uniform profiling pipeline (Chapter~\ref{ch:triton}) turned
+out to be as valuable as the kernels themselves: it allowed every
+number in the thesis to be reproduced with a single command and
+flagged several false positives (most notably the $20\%$ regression
+that turned out to be a miskeyed auto-tune cache entry).
+
+\section{Limitations}\label{sec:concl_limitations}
+
+\subsection{Single-Node Scope}\label{sec:concl_single_node}
+All measurements are on a single 8-GPU A100 node. Multi-node scaling
+would introduce an InfiniBand (or similar) hop whose latency
+characteristics are fundamentally different from NVLink-3. Strategies
+that minimise cross-node traffic (pipeline parallelism, 2-D sharding,
+gradient compression) would likely shift the recommendation away from
+pure ZeRO-3.
+
+\subsection{A100 Focus}\label{sec:concl_a100}
+The kernel numbers are specific to A100. H100 brings asynchronous
+WGMMA, TMA, DSMEM, and an FP8 transformer engine, all of which shift
+the knee of the roofline and would require retuning. The CUTLASS and
+Triton code paths are structurally ready for H100; only the
+auto-tune search space and the tile shapes need updating.
+
+\subsection{Prototype-Level SWFA
+Kernel}\label{sec:concl_swfa_proto}
+The SWFA kernel is implemented in PyTorch with CPU-optimised paths.
+A production CUDA/Triton kernel is sketched in
+Chapter~\ref{ch:triton} but has not yet been deployed in an
+end-to-end serving run. The $50$--$59\%$ training speedup numbers are
+therefore likely a lower bound; a hand-tuned CUTLASS port should push
+further.
+
+\section{Future Work}\label{sec:concl_future}
+
+\subsection{Short term (6--12 months)}\label{sec:concl_short}
+\begin{itemize}
+    \item Complete the CUDA/Triton port of SWFA and its backward
+          pass; target a further $2$--$3\times$ speedup via Tensor-Core
+          utilisation. Extend the block classifier to handle
+          user-declared sparse patterns (strided, global, BigBird-like)
+          within the same kernel skeleton.
+    \item Finish the Triton auto-tuner campaign on H100 and publish a
+          shape-indexed configuration cache that covers the most
+          common LLM shapes out of the box.
+    \item Integrate SWFA into the SGLang prefill kernel so that the
+          decoupling between the prefill and decode attention paths
+          is complete.
+\end{itemize}
+
+\subsection{Medium term (1--2 years)}\label{sec:concl_medium}
+\begin{itemize}
+    \item Multi-vendor support: port the stack to Intel Xe GPUs via
+          oneDNN and SYCL, and to AMD via ROCm and Composable Kernel.
+          The CuTe layout algebra is the portable core; the vendor-%
+          specific parts are the MMA instruction traits.
+    \item Hierarchical communication for multi-node training, with
+          gradient compression and error compensation. A first step is
+          to integrate Zero++ with InfiniBand-aware NCCL algorithms.
+    \item Automatic policy selection: a lightweight runtime that
+          chooses between DDP/FSDP/ZeRO-3 and the best attention
+          kernel based on the model shape and the available hardware.
+          The scaling-laws literature~\cite{hoffmann2022chinchilla}
+          suggests that the decision can be precomputed offline from
+          $(M, N, d, w, P)$ alone.
+\end{itemize}
+
+\subsection{Longer term}\label{sec:concl_long}
+\begin{itemize}
+    \item Co-design of the attention pattern with the training curriculum:
+          the cost model of Chapter~\ref{ch:swfa} assumes a fixed
+          attention decay $\lambda$, but in practice $\lambda$ changes
+          during training. A schedule that grows $w$ as $\lambda$
+          decreases would turn $w^\star$ into a time-varying curriculum.
+    \item Integration with emerging low-precision formats (FP4, NVFP6)
+          that require fused scale/dequantisation epilogues; both
+          CUTLASS and Triton already support the necessary fused
+          instructions on Hopper.
+    \item Carbon-aware scheduling of training runs: combining the
+          energy-per-epoch numbers of Chapter~\ref{ch:distributed}
+          with a real-time grid carbon signal would shift training
+          windows to low-carbon hours without extending the wall-clock
+          of the campaign.
+\end{itemize}
+
+\section{Closing Remarks}\label{sec:concl_closing}
+Efficient training and serving of LLMs is not the product of a single
+algorithmic trick---it requires simultaneously tuning the distributed
+schedule, the kernel implementation, and the attention algorithm. The
+work presented here approaches each of these layers in isolation and
+then shows that they compose, yielding substantial improvements in
+throughput, memory use, and energy efficiency while remaining
+numerically faithful. As models continue to grow, this holistic
+view---rather than point optimisations within a single framework---is
+likely to remain the right way to deliver practical performance on
+the hardware that is actually available today.
+
+The principal hope of the author is that the pieces delivered in this
+thesis, most importantly the SWFA algorithm with its proof of
+correctness, the controlled distributed-training comparison, and the
+Triton profiling pipeline, serve as building blocks that are useful
+well beyond the specific workloads evaluated here. The full algorithmic
+pseudocode and reference PyTorch implementations are given in
+Appendix~A; the rigorous proofs underlying the main theoretical
+results are in Appendix~B.

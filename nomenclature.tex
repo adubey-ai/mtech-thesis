@@ -1,0 +1,19 @@
+\begin{longtable}[l]{l l}
+$N$                 & Sequence length (in tokens/positions) \\
+$d$                 & Embedding/head dimension \\
+$H$                 & Number of attention heads \\
+$B$                 & Batch size \\
+$B_r, B_c$          & Flash-Attention block sizes along query/key axes \\
+$T_r, T_c$          & Number of row/column blocks, $T_r=\lceil N/B_r\rceil$ \\
+$w_l, w_r$          & Left/right sliding-window sizes \\
+$w$                 & Total window size, $w=w_l+w_r+1$ \\
+$Q, K, V$           & Query, key and value matrices \\
+$O$                 & Attention output \\
+$m_i, \ell_i$       & Online softmax running max and sum for row $i$ \\
+$P$                 & Number of parallel processes/GPUs \\
+$\kappa$            & Per-FLOP hardware cost (seconds/FLOP) \\
+$\lambda$           & Attention decay rate (1/position) \\
+$A_0$               & Base attention importance \\
+$\alpha,\beta,\gamma$ & Computational, memory and performance cost weights \\
+$\mathcal{I},\mathcal{X},\mathcal{O}$ & Fully-inside, intersecting and fully-outside block sets \\
+\end{longtable}

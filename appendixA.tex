@@ -1,0 +1,463 @@
+\chapter{Algorithms and Reference Implementations}
+\label{chp:appA}
+
+This appendix collects the full algorithmic pseudocode and the
+reference PyTorch/Triton implementations that accompany the chapters
+of the main text. The listings are written so that each can be lifted
+into a fresh environment, compiled, and reproduced independently.
+
+\section{Block Classification}\label{app:classify}
+
+The block classification routine of Chapter~\ref{ch:swfa} partitions
+the $T_r \times T_c$ grid of attention blocks into three disjoint
+sets: \emph{inside}, \emph{intersecting}, and \emph{outside}. The
+routine is $\mathcal{O}(T_r T_c)$ in arithmetic operations.
+
+\begin{algorithm}[H]
+    \caption{\textsc{ClassifyBlocks}: detailed reference.}
+    \label{alg:appendix_classify}
+    \KwIn{$N$, $(w_l, w_r)$, $(B_r, B_c)$.}
+    \KwOut{$\mathcal{I}, \mathcal{X}, \mathcal{O}$: lists of block
+           indices.}
+    $T_r \leftarrow \lceil N / B_r \rceil$;\
+    $T_c \leftarrow \lceil N / B_c \rceil$\;
+    $\mathcal{I} \leftarrow \emptyset$;\
+    $\mathcal{X} \leftarrow \emptyset$;\
+    $\mathcal{O} \leftarrow \emptyset$\;
+    \For{$r = 0$ \KwTo $T_r-1$}{
+        $r_0 \leftarrow r B_r$;\ $r_1 \leftarrow \min(N, (r+1)B_r)-1$\;
+        \For{$c = 0$ \KwTo $T_c-1$}{
+            $c_0 \leftarrow c B_c$;\ $c_1 \leftarrow \min(N,(c+1)B_c)-1$\;
+            \tcp*[l]{outside-check using Lemma~\ref{lem:corner}}
+            \uIf{$c_1 < r_0 - w_l$ \textbf{or} $c_0 > r_1 + w_r$}{
+                $\mathcal{O} \leftarrow \mathcal{O} \cup \{(r,c)\}$\;
+            }\uElseIf{$c_1 \le r_0 + w_r$ \textbf{and} $c_0 \ge r_1 - w_l$}{
+                $\mathcal{I} \leftarrow \mathcal{I} \cup \{(r,c)\}$\;
+            }\Else{
+                $\mathcal{X} \leftarrow \mathcal{X} \cup \{(r,c)\}$\;
+            }
+        }
+    }
+    \Return $(\mathcal{I}, \mathcal{X}, \mathcal{O})$\;
+\end{algorithm}
+
+\subsection{Reference PyTorch Implementation}
+
+\begin{lstlisting}[language=Python,basicstyle=\ttfamily\scriptsize]
+def classify_blocks(N, wl, wr, Br, Bc):
+    Tr = (N + Br - 1) // Br
+    Tc = (N + Bc - 1) // Bc
+    I, X, O = [], [], []
+    for r in range(Tr):
+        r0 = r * Br
+        r1 = min(N, (r + 1) * Br) - 1
+        for c in range(Tc):
+            c0 = c * Bc
+            c1 = min(N, (c + 1) * Bc) - 1
+            outside = (c1 < r0 - wl) or (c0 > r1 + wr)
+            inside  = (c1 <= r0 + wr) and (c0 >= r1 - wl)
+            if outside:
+                O.append((r, c))
+            elif inside:
+                I.append((r, c))
+            else:
+                X.append((r, c))
+    return I, X, O
+\end{lstlisting}
+
+\section{Vectorised Mask Generation}\label{app:mask}
+
+The vectorised mask generator (Algorithm~\ref{alg:swfa_mask}) avoids
+the nested $\mathcal{O}(B_r B_c)$ loop by constructing the mask as the
+logical OR of a \texttt{triu} and a \texttt{tril}.
+
+\begin{algorithm}[H]
+    \caption{\textsc{GenerateMask}: reference version.}
+    \label{alg:appendix_mask}
+    \KwIn{$(r, c)$, $(B_r, B_c)$, $(w_l, w_r)$.}
+    \KwOut{Additive mask $M \in \{0, -\infty\}^{B_r \times B_c}$.}
+    $\delta \leftarrow c B_c - r B_r$\;
+    $d_R \leftarrow \lfloor w_r + \delta \rfloor + 1$\;
+    $d_L \leftarrow \lfloor -w_l + \delta \rfloor - 1$\;
+    both $\leftarrow (d_R \le B_r) \wedge (d_L \ge -B_c)$\;
+    \uIf{both}{
+        $M_R \leftarrow \mathrm{triu}(\mathbf{1}_{B_r\times B_c}, d_R)$\;
+        $M_L \leftarrow \mathrm{tril}(\mathbf{1}_{B_r\times B_c}, d_L)$\;
+        $M_{\mathrm{bool}} \leftarrow M_R \vee M_L$\;
+    }\uElseIf{$d_R \le B_r$}{
+        $M_{\mathrm{bool}} \leftarrow
+            \mathrm{triu}(\mathbf{1}_{B_r\times B_c}, d_R)$\;
+    }\uElseIf{$d_L \ge -B_c$}{
+        $M_{\mathrm{bool}} \leftarrow
+            \mathrm{tril}(\mathbf{1}_{B_r\times B_c}, d_L)$\;
+    }\Else{
+        $M_{\mathrm{bool}} \leftarrow \mathbf{0}$\;
+    }
+    $M \leftarrow \mathbf{0}$;\
+    $M[M_{\mathrm{bool}}] \leftarrow -\infty$\;
+    \Return $M$\;
+\end{algorithm}
+
+\subsection{Reference PyTorch Implementation}
+
+\begin{lstlisting}[language=Python,basicstyle=\ttfamily\scriptsize]
+import torch
+
+def generate_mask(r, c, Br, Bc, wl, wr, device="cpu"):
+    delta = c * Bc - r * Br
+    d_right = int(wr + delta) + 1
+    d_left  = int(-wl + delta) - 1
+    ones = torch.ones(Br, Bc, dtype=torch.bool, device=device)
+    both = (d_right <= Br) and (d_left >= -Bc)
+    if both:
+        mask_bool = torch.triu(ones, diagonal=d_right) | \
+                    torch.tril(ones, diagonal=d_left)
+    elif d_right <= Br:
+        mask_bool = torch.triu(ones, diagonal=d_right)
+    elif d_left >= -Bc:
+        mask_bool = torch.tril(ones, diagonal=d_left)
+    else:
+        mask_bool = torch.zeros_like(ones)
+    mask = torch.zeros(Br, Bc, dtype=torch.float32, device=device)
+    mask.masked_fill_(mask_bool, float("-inf"))
+    return mask
+\end{lstlisting}
+
+\section{Full SWFA Forward Pass}\label{app:forward}
+
+\begin{algorithm}[H]
+    \caption{\textsc{SWFA-Forward}: full expanded reference.}
+    \label{alg:appendix_forward}
+    \KwIn{$Q, K, V$; $(w_l, w_r)$; $(B_r, B_c)$; $\varepsilon > 0$.}
+    \KwOut{$O$.}
+    $(\mathcal{I}, \mathcal{X}, \mathcal{O}) \leftarrow
+        \textsc{ClassifyBlocks}(N, w_l, w_r, B_r, B_c)$\;
+    \For{$r = 0$ \KwTo $T_r - 1$}{
+        $Q_r \leftarrow Q[r B_r : (r+1)B_r]$\;
+        $O_r \leftarrow \mathbf{0}_{B_r \times d_v}$;\
+        $m_r \leftarrow -\infty$;\
+        $\ell_r \leftarrow 0$\;
+        \For{$c = 0$ \KwTo $T_c - 1$}{
+            \If{$(r,c) \in \mathcal{O}$}{\textbf{continue}}
+            $K_c \leftarrow K[c B_c : (c+1)B_c]$;\
+            $V_c \leftarrow V[c B_c : (c+1)B_c]$\;
+            $S \leftarrow (Q_r K_c^\top) / \sqrt{d}$\;
+            \If{$(r,c) \in \mathcal{X}$}{
+                $M \leftarrow \textsc{GenerateMask}(r, c, B_r, B_c,
+                                                   w_l, w_r)$\;
+                $S \leftarrow S + M$\;
+            }
+            $m' \leftarrow \max(m_r, \max(S, \text{axis=1}))$\;
+            $\mathrm{corr} \leftarrow \exp(m_r - m')$\;
+            $P \leftarrow \exp(S - m')$\;
+            $\ell_r \leftarrow \mathrm{corr}\cdot\ell_r + \sum P$\;
+            $O_r \leftarrow \mathrm{corr}\cdot O_r + P V_c$\;
+            $m_r \leftarrow m'$\;
+        }
+        $O[r B_r:(r+1)B_r] \leftarrow O_r / (\ell_r + \varepsilon)$\;
+    }
+    \Return $O$\;
+\end{algorithm}
+
+\subsection{Reference PyTorch Implementation (CPU path)}
+
+\begin{lstlisting}[language=Python,basicstyle=\ttfamily\scriptsize]
+def swfa_forward(Q, K, V, wl, wr, Br=16, Bc=16, eps=1e-6):
+    """Single-head sliding-window flash attention (CPU reference).
+    Q, K: [N, d];  V: [N, dv]
+    Returns O: [N, dv]
+    """
+    N, d   = Q.shape
+    _, dv  = V.shape
+    O = torch.zeros(N, dv, dtype=Q.dtype, device=Q.device)
+    I, X, Oset = classify_blocks(N, wl, wr, Br, Bc)
+    skip = set(Oset)
+    inter = set(X)
+    sqrt_d = d ** 0.5
+    Tr = (N + Br - 1) // Br
+    Tc = (N + Bc - 1) // Bc
+    for r in range(Tr):
+        Qr = Q[r*Br : min((r+1)*Br, N)]
+        Or = torch.zeros(Qr.shape[0], dv, dtype=Q.dtype)
+        mr = torch.full((Qr.shape[0], 1), float("-inf"))
+        lr = torch.zeros(Qr.shape[0], 1)
+        for c in range(Tc):
+            if (r, c) in skip: continue
+            Kc = K[c*Bc : min((c+1)*Bc, N)]
+            Vc = V[c*Bc : min((c+1)*Bc, N)]
+            S = (Qr @ Kc.T) / sqrt_d
+            if (r, c) in inter:
+                M = generate_mask(r, c, Qr.shape[0], Kc.shape[0],
+                                  wl, wr, device=Q.device)
+                S = S + M
+            m_new = torch.maximum(mr, S.max(dim=1, keepdim=True).values)
+            corr  = torch.exp(mr - m_new)
+            P     = torch.exp(S - m_new)
+            lr    = corr * lr + P.sum(dim=1, keepdim=True)
+            Or    = corr * Or + P @ Vc
+            mr    = m_new
+        O[r*Br : min((r+1)*Br, N)] = Or / (lr + eps)
+    return O
+\end{lstlisting}
+
+\section{Full SWFA Backward Pass}\label{app:backward}
+
+\begin{algorithm}[H]
+    \caption{\textsc{SWFA-Backward}: full expanded reference.}
+    \label{alg:appendix_backward}
+    \KwIn{$Q, K, V$; saved $(m_r, \ell_r, O_r)$ for every $r$;
+          $\mathrm{d}O$;
+          $(\mathcal{I}, \mathcal{X}, \mathcal{O})$.}
+    \KwOut{$\mathrm{d}Q, \mathrm{d}K, \mathrm{d}V$.}
+    \tcp*[l]{first sweep: precompute $\rho_r = \sum_c P_{rc}\odot
+            (\mathrm{d}O_r V_c^\top)$}
+    \For{$r = 0$ \KwTo $T_r-1$}{
+        $\rho_r \leftarrow \mathbf{0}$\;
+        \For{$c$ \textbf{with} $(r,c) \notin \mathcal{O}$}{
+            $S \leftarrow (Q_r K_c^\top)/\sqrt{d}$\;
+            \If{$(r,c) \in \mathcal{X}$}{$S \leftarrow S+M_{rc}$\;}
+            $P \leftarrow \exp(S - m_r)/\ell_r$\;
+            $\rho_r \leftarrow \rho_r +
+                \mathrm{sum}_{\mathrm{row}}(P \odot
+                (\mathrm{d}O_r V_c^\top))$\;
+        }
+    }
+    \tcp*[l]{second sweep: accumulate gradients}
+    \For{$r = 0$ \KwTo $T_r-1$}{
+        \For{$c = 0$ \KwTo $T_c-1$}{
+            \If{$(r,c) \in \mathcal{O}$}{\textbf{continue}}
+            $S \leftarrow (Q_r K_c^\top)/\sqrt{d}$\;
+            \If{$(r,c) \in \mathcal{X}$}{$S \leftarrow S+M_{rc}$\;}
+            $P \leftarrow \exp(S - m_r)/\ell_r$\;
+            $\mathrm{d}V_c \mathrel{+}=
+                P^\top\,\mathrm{d}O_r$\;
+            $\mathrm{d}P \leftarrow \mathrm{d}O_r V_c^\top$\;
+            $\mathrm{d}S \leftarrow P \odot
+                (\mathrm{d}P - \rho_r)$\;
+            $\mathrm{d}Q_r \mathrel{+}= \mathrm{d}S\,K_c/\sqrt{d}$\;
+            $\mathrm{d}K_c \mathrel{+}= \mathrm{d}S^\top\,Q_r/\sqrt{d}$\;
+        }
+    }
+    \Return $(\mathrm{d}Q, \mathrm{d}K, \mathrm{d}V)$\;
+\end{algorithm}
+
+\section{Distributed-Training Reference
+Scripts}\label{app:dist_scripts}
+
+The DP/DDP/FSDP/ZeRO-3 skeletons used in
+Chapter~\ref{ch:distributed} are collected below.
+
+\subsection{DDP Launcher}
+\begin{lstlisting}[language=Python,basicstyle=\ttfamily\scriptsize]
+import os, torch, torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+def main():
+    local_rank = int(os.environ["LOCAL_RANK"])
+    dist.init_process_group("nccl")
+    torch.cuda.set_device(local_rank)
+    model = build_model().cuda(local_rank)
+    model = DDP(model, device_ids=[local_rank],
+                bucket_cap_mb=25, find_unused_parameters=False)
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    for step, batch in enumerate(loader):
+        out  = model(batch.x.cuda(local_rank))
+        loss = loss_fn(out, batch.y.cuda(local_rank))
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
+
+\subsection{FSDP Launcher}
+\begin{lstlisting}[language=Python,basicstyle=\ttfamily\scriptsize]
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    ShardingStrategy)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+import functools
+
+mp_policy = MixedPrecision(param_dtype=torch.float16,
+                           reduce_dtype=torch.float32,
+                           buffer_dtype=torch.float16)
+
+wrap_policy = functools.partial(
+    transformer_auto_wrap_policy,
+    transformer_layer_cls={TransformerBlock})
+
+model = FSDP(build_model().cuda(local_rank),
+             auto_wrap_policy=wrap_policy,
+             mixed_precision=mp_policy,
+             sharding_strategy=ShardingStrategy.FULL_SHARD,
+             device_id=local_rank)
+\end{lstlisting}
+
+\subsection{DeepSpeed ZeRO-3 Configuration}
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
+{
+  "zero_optimization": {
+    "stage": 3,
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "stage3_prefetch_bucket_size": 2e8,
+    "stage3_param_persistence_threshold": 1e6,
+    "stage3_max_live_parameters": 1e9,
+    "stage3_max_reuse_distance": 1e9,
+    "reduce_bucket_size": 5e8
+  },
+  "fp16": { "enabled": true, "loss_scale_window": 1000,
+            "initial_scale_power": 16 },
+  "optimizer": {
+    "type": "AdamW",
+    "params": { "lr": 3e-4, "betas": [0.9, 0.999], "eps": 1e-8 }
+  },
+  "train_micro_batch_size_per_gpu": 4,
+  "gradient_accumulation_steps": 1,
+  "gradient_clipping": 1.0,
+  "wall_clock_breakdown": false
+}
+\end{lstlisting}
+
+\section{CUTLASS Kernel Snippets}\label{app:cutlass_snippets}
+
+\subsection{GEMM + Bias + GELU Epilogue}
+\begin{lstlisting}[language=C++,basicstyle=\ttfamily\scriptsize]
+using Gemm = cutlass::gemm::device::GemmUniversal<
+    cutlass::half_t, cutlass::layout::RowMajor,
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t, cutlass::layout::RowMajor,
+    float,                            // accumulator
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128,128,32>,
+    cutlass::gemm::GemmShape< 64, 64,32>,
+    cutlass::gemm::GemmShape< 16,  8,16>,
+    cutlass::epilogue::thread::LinearCombinationGELU<
+        cutlass::half_t, 8, float, float>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+    3                                 // num pipeline stages
+>;
+\end{lstlisting}
+
+\subsection{Grouped GEMM Launch}
+\begin{lstlisting}[language=C++,basicstyle=\ttfamily\scriptsize]
+using GroupGemm = cutlass::gemm::device::GemmGrouped<
+    cutlass::half_t, cutlass::layout::RowMajor,
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t, cutlass::layout::RowMajor,
+    float,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128,128,32>,
+    cutlass::gemm::GemmShape< 64, 64,32>,
+    cutlass::gemm::GemmShape< 16,  8,16>,
+    cutlass::epilogue::thread::LinearCombination<
+        cutlass::half_t, 8, float, float>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+    4                                 // num experts per launch
+>;
+\end{lstlisting}
+
+\section{Triton SWFA Kernel}\label{app:triton_swfa}
+
+The Triton implementation of SWFA used for the cross-validation in
+Section~\ref{sec:triton_swfa} is reproduced below in full.
+
+\begin{lstlisting}[language=Python,basicstyle=\ttfamily\scriptsize]
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_R': 64,  'BLOCK_C': 64},
+                      num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_R': 64,  'BLOCK_C': 128},
+                      num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_R': 128, 'BLOCK_C': 64},
+                      num_warps=8, num_stages=3),
+    ],
+    key=['N', 'd', 'wl', 'wr'])
+@triton.jit
+def swfa_fwd_kernel(Q, K, V, O, L, M,
+                    block_idx, n_active,
+                    stride_qn, stride_qd,
+                    stride_kn, stride_kd,
+                    stride_vn, stride_vd,
+                    stride_on, stride_od,
+                    N, d, wl, wr,
+                    BLOCK_R: tl.constexpr,
+                    BLOCK_C: tl.constexpr):
+    pid = tl.program_id(0)
+    if pid >= n_active:
+        return
+    rc = tl.load(block_idx + pid)
+    r = rc // 65536
+    c = rc %  65536
+
+    # Load Q tile
+    offs_r = r * BLOCK_R + tl.arange(0, BLOCK_R)
+    offs_c = c * BLOCK_C + tl.arange(0, BLOCK_C)
+    offs_d = tl.arange(0, d)
+    Q_tile = tl.load(Q + offs_r[:, None]*stride_qn +
+                         offs_d[None, :]*stride_qd,
+                     mask=(offs_r[:, None] < N))
+
+    K_tile = tl.load(K + offs_c[:, None]*stride_kn +
+                         offs_d[None, :]*stride_kd,
+                     mask=(offs_c[:, None] < N))
+
+    # Scores
+    scale = 1.0 / tl.sqrt(tl.full([1], d, dtype=tl.float32))
+    S = tl.dot(Q_tile, tl.trans(K_tile)) * scale
+
+    # Sliding-window mask (only for intersecting blocks)
+    delta = c * BLOCK_C - r * BLOCK_R
+    rel   = offs_c[None, :] - offs_r[:, None] - delta
+    in_win = (rel <= wr) & (rel >= -wl)
+    S = tl.where(in_win, S, float("-inf"))
+
+    # Online softmax
+    m_new = tl.max(S, axis=1)
+    P     = tl.exp(S - m_new[:, None])
+    l_new = tl.sum(P, axis=1)
+
+    V_tile = tl.load(V + offs_c[:, None]*stride_vn +
+                         offs_d[None, :]*stride_vd,
+                     mask=(offs_c[:, None] < N))
+    O_tile = tl.dot(P.to(V_tile.dtype), V_tile) / l_new[:, None]
+
+    tl.store(O + offs_r[:, None]*stride_on +
+                 offs_d[None, :]*stride_od, O_tile,
+             mask=(offs_r[:, None] < N))
+\end{lstlisting}
+
+\section{Numerical Validation Harness}\label{app:validation}
+
+The harness used to produce Table~\ref{tab:swfa_accuracy} follows.
+
+\begin{lstlisting}[language=Python,basicstyle=\ttfamily\scriptsize]
+import torch, math
+
+def vanilla_attn(Q, K, V, wl, wr):
+    N, d = Q.shape
+    S = (Q @ K.T) / math.sqrt(d)
+    i = torch.arange(N)[:, None]
+    j = torch.arange(N)[None, :]
+    mask = (j - i > wr) | (i - j > wl)
+    S = S.masked_fill(mask, float("-inf"))
+    P = torch.softmax(S, dim=-1)
+    return P @ V
+
+def validate(N=32, d=16, wl=4, wr=4, Br=8, Bc=8, seed=42, dtype=torch.float32):
+    torch.manual_seed(seed)
+    Q = torch.randn(N, d,  dtype=dtype)
+    K = torch.randn(N, d,  dtype=dtype)
+    V = torch.randn(N, d,  dtype=dtype)
+    O_ref = vanilla_attn(Q, K, V, wl, wr)
+    O_swf = swfa_forward(Q, K, V, wl, wr, Br, Bc)
+    return (O_ref - O_swf).abs().max().item(), \
+           (O_ref - O_swf).abs().mean().item()
+\end{lstlisting}
