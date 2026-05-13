@@ -17,6 +17,9 @@
 *.bcf
 *-blx.bib
 *.synctex.gz
+*.nav
+*.snm
+*.vrb
 
 # Pandoc-generated outputs (build from source when needed)
 doct.docx
@@ -25,3 +28,9 @@ doct.pdf
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Backup zip (template snapshot — don't commit)
+IISTThesis-master-original.zip
+
+# Defense slides — intermediate image cache
+_pptx_tmp/
