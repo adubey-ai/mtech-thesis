@@ -272,7 +272,7 @@ individual elements are zero, so element-level sparsity delivers no
 wall-clock saving unless the hardware itself supports a structured
 pruning format. Block sparsity, in contrast, maps cleanly onto the
 threadblock-level tiling of CUTLASS/CuTe: a block that is classified
-as \enquote{skip} simply does not enter the loop nest of
+as ``skip'' simply does not enter the loop nest of
 Algorithm~\ref{alg:swfa}. This observation is what allows SWFA to
 deliver measurable speedups without a custom Tensor-Core ISA; the
 same pattern has been applied to strided sparsity in Sparse
