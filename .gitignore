@@ -21,9 +21,6 @@
 *.snm
 *.vrb
 
-# Pandoc-generated outputs (build from source when needed)
-doct.docx
-
 # OS noise
 .DS_Store
 Thumbs.db
