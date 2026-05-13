@@ -34,3 +34,8 @@ IISTThesis-master-original.zip
 
 # Defense slides — intermediate image cache
 _pptx_tmp/
+
+# Python virtualenv (do not commit)
+.venv/
+__pycache__/
+*.pyc
