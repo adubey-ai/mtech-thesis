@@ -1,55 +1,59 @@
 \chapter{GPU Kernels in the SGLang Runtime}\label{ch:sglang}
 
-\emph{Placement in the stack.} The previous three chapters built the
-training-side half of the stack. This chapter pivots to the
-serving-side half. Two of the kernel abstractions developed earlier
-re-appear in a new context: the CUTLASS/CuTe templates of
+\emph{Placement in the stack.} The previous three chapters dealt
+with the training side of the stack; this one pivots to the
+serving side. Two of the kernel abstractions developed earlier
+reappear in this new context: the CUTLASS and CuTe templates of
 Chapter~\ref{ch:cutlass} drive the logit-projection GEMM, and the
-Sliding Window Flash Attention of Chapter~\ref{ch:swfa} drives the
-long-context prefill path. The remaining kernels discussed in this
-chapter---paged KV cache, fused decode attention, and fused
-top-$k$/top-$p$ sampling---are specific to the decode phase and have
-no direct analogue on the training side.
+Sliding Window Flash Attention kernel of Chapter~\ref{ch:swfa}
+drives the long-context prefill path. The remaining kernels
+covered here---the paged KV cache, the fused decode attention,
+and the fused top-$k$/top-$p$ sampler---are specific to the
+decode phase and have no direct counterpart on the training side.
 
-This chapter describes the serving-side component of the software
-stack: GPU kernels developed inside the SGLang
-runtime~\cite{sglang} for efficient long-context LLM inference. Unlike
-training, inference is dominated by the incremental decoding phase,
-where each request grows its key--value (KV) cache one token at a time.
-Kernel design in this regime must therefore optimise KV management,
-attention kernels for growing sequences, and scheduler/kernel
-interaction.
+The subject of the chapter, then, is the serving-side component of
+the software stack: the GPU kernels developed inside the SGLang
+runtime~\cite{sglang} for efficient long-context LLM inference.
+Inference differs from training in that it is dominated by the
+incremental decoding phase, in which every active request grows
+its own key-value (KV) cache one token at a time. The design of
+kernels in this regime must therefore simultaneously optimise the
+management of the KV cache, the attention kernel on sequences that
+grow step by step, and the interaction between the kernels and the
+host-side scheduler.
 
 \section{Background: SGLang}\label{sec:sglang_bg}
-SGLang is an open-source runtime for large-language-model serving that
-introduces two main ideas:
+SGLang is an open-source runtime for serving large language
+models. Two ideas give it its identity:
 \begin{itemize}
-    \item \textbf{RadixAttention}: a KV cache organised as a radix tree
-          so that shared prefixes (e.g., system prompts, few-shot
-          examples) are stored only once;
-    \item \textbf{Structured generation language}: a front-end that
-          turns complex multi-step prompts into a scheduled dataflow of
-          kernel calls.
+    \item \textbf{RadixAttention}: the KV cache is organised as a
+          radix tree so that shared prefixes---system prompts,
+          few-shot exemplars, and so on---are only stored once.
+    \item \textbf{Structured generation language}: a front-end
+          that compiles complex multi-step prompts into a
+          scheduled dataflow of kernel calls.
 \end{itemize}
-Both features stress the GPU kernel layer: RadixAttention changes the
-access pattern of the attention kernel, and structured generation
-produces many small, tightly scheduled kernel launches.
+Both features exert pressure on the GPU kernel layer:
+RadixAttention changes the memory-access pattern seen by the
+attention kernel, and structured generation yields a stream of
+many small, tightly scheduled kernel launches.
 
 \subsection{The Radix Tree}\label{sec:sglang_radix}
-A radix tree (or Patricia trie) stores the per-request prompt
-token-id sequences with maximal prefix sharing. Edges carry arbitrary
-token strings; nodes hold references to the slices of the paged KV
-cache that correspond to that prefix. For a serving workload with
-$R$ requests and an average shared-prefix length $L_{\text{shared}}$,
-the KV memory is reduced by a factor
+A radix tree---or Patricia trie---stores the per-request prompt
+token-id sequences with maximal prefix sharing. Edges carry
+arbitrary token strings, and each node holds references to the
+slices of the paged KV cache that correspond to the prefix ending
+at that node. For a workload with $R$ active requests and an
+average shared prefix of length $L_{\text{shared}}$, the KV memory
+shrinks by a factor of
 \begin{equation}
     \rho_{\text{shared}} =
     1 - \frac{L_{\text{shared}}}{L_{\text{shared}} + L_{\text{unique}}},
 \end{equation}
-where $L_{\text{unique}}$ is the average per-request unique suffix
-length. In practical chat-style workloads, $\rho_{\text{shared}}$ is
-often between $0.4$ and $0.8$, delivering a near-linear memory saving
-with batch size.
+where $L_{\text{unique}}$ is the average length of the
+request-specific suffix. For typical chat-style workloads
+$\rho_{\text{shared}}$ sits somewhere between $0.4$ and $0.8$,
+giving a near-linear memory saving as the batch grows.
 
 \begin{figure}[H]
     \centering
@@ -101,13 +105,14 @@ with batch size.
 \end{figure}
 
 \subsection{Paged KV Cache}\label{sec:sglang_paged_bg}
-Following the vLLM~\cite{vllm} design, SGLang's KV cache is stored in
-fixed-size \emph{pages}. Each page is a contiguous tensor of shape
-$(\text{page\_size}, H, d_{\text{head}})$ for keys and likewise for
-values; a per-request \emph{block table} maps logical token indices
-into physical page indices. Because pages are all of the same size, the
-allocator never fragments, and attention kernels can read the block
-table with a single 32-bit load per block.
+Following the vLLM~\cite{vllm} design, SGLang's KV cache is kept
+as a pool of fixed-size \emph{pages}. Each page is a contiguous
+tensor of shape $(\text{page\_size}, H, d_{\text{head}})$ for
+keys and likewise for values, and a per-request \emph{block
+table} maps logical token indices into physical page indices.
+Because every page has the same size, the allocator never
+fragments; the attention kernel, for its part, can read the
+block table with a single 32-bit load per block.
 
 \begin{figure}[H]
     \centering
@@ -162,132 +167,143 @@ table with a single 32-bit load per block.
 \end{figure}
 
 \section{Execution Model}\label{sec:sglang_exec}
-A serving step in SGLang consists of four GPU phases:
+A single serving step in SGLang decomposes into four GPU phases:
 \begin{enumerate}
-    \item \textbf{Prefill} --- run attention and MLPs over the entire
-          prompt in a single batched pass; the KV cache is written for
-          every token in the prompt;
-    \item \textbf{KV write-back} --- append the prompt's keys and
-          values to the per-request KV cache slot in the radix tree,
-          updating the block table;
-    \item \textbf{Decode} --- for each active request, compute
-          attention between the new query token and the cached
-          keys/values; produce one logit vector per request;
-    \item \textbf{Sampling} --- top-$k$/top-$p$/temperature sampling
-          on the logits, emitting the next token for each request.
+    \item \textbf{Prefill} --- attention and MLPs are run over the
+          entire prompt in one batched pass, and the KV cache is
+          written out for every token of the prompt.
+    \item \textbf{KV write-back} --- the prompt's keys and values
+          are appended to the per-request KV-cache slot in the
+          radix tree, and the block table is updated accordingly.
+    \item \textbf{Decode} --- for each active request, attention
+          is computed between the new query token and the cached
+          keys and values, producing one logit vector per request.
+    \item \textbf{Sampling} --- top-$k$, top-$p$, and
+          temperature-based sampling are applied to the logits to
+          emit the next token for each request.
 \end{enumerate}
-Phases (1) and (3) have very different kernel requirements: prefill is
-compute-bound (a long $Q$ against a long $K$), decode is memory-bound
-(a single-token $Q$ against a long $K$).
+Phases (1) and (3) place very different demands on the kernel
+layer: prefill pits a long $Q$ against a long $K$ and is
+compute-bound, while decode pits a single-token $Q$ against a long
+$K$ and is memory-bound.
 
 \section{Kernel-Level Optimisations}\label{sec:sglang_kernels}
 
 \subsection{Paged KV Cache}\label{sec:sglang_paged}
-Following the vLLM~\cite{vllm} design, SGLang's KV cache is stored in
-fixed-size \emph{pages} so that the cache never fragments and so that
-the attention kernel can address it with 32-bit page indices. The
-kernel's address-computation path uses one page-table lookup per
-block; the lookup latency is hidden behind the compute of the
-previous block. The page size is set to $16$ tokens, which is the
-largest power of two that still fits a single $16\!\times\!16$ tile of
-the attention kernel into shared memory at
-$H = 32$, $d_{\text{head}} = 128$ for FP16.
+Following the vLLM~\cite{vllm} design, SGLang stores its KV cache
+in fixed-size \emph{pages}, so that the cache never fragments and
+so that the attention kernel can address it through 32-bit page
+indices. One page-table lookup per block appears on the kernel's
+address-computation path, and the latency of that lookup is
+hidden behind the compute of the previous block. The page size is
+set to $16$ tokens; this is the largest power of two that still
+lets a single $16 \times 16$ tile of the attention kernel fit
+into shared memory for $H = 32$, $d_{\text{head}} = 128$ in FP16.
 
 \subsection{Decode Attention Kernel}\label{sec:sglang_decode}
-During decode, the query is a single token but the key/value tensor
-spans the entire history. The attention reduces to a batched
-matrix-vector product:
+During decode the query is a single token but the key/value
+tensor covers the full history. Attention then reduces to a
+batched matrix-vector product,
 \[
     O = \mathrm{softmax}\!\left(q K^{\!\top} / \sqrt{d}\right) V,
 \]
-with $q \in \mathbb{R}^{1 \times d}$, $K, V \in \mathbb{R}^{L \times
-d}$. The kernel is memory-bound, so the main optimisations are:
+with $q \in \mathbb{R}^{1 \times d}$ and $K, V \in \mathbb{R}^{L
+\times d}$. The kernel is memory-bound by construction, and the
+principal optimisations are therefore:
 \begin{itemize}
-    \item contiguous reads of the paged KV cache via vectorised loads
-          (\texttt{ldmatrix} / $128$-bit \texttt{ld.global});
-    \item block-level reduction of the softmax numerator/denominator
-          in shared memory, with only a single global atomic for
-          cross-block merge;
-    \item warp-specialised schedule so that one warp drives the load
-          and another warp drives the MMA;
-    \item prefetching the next page into shared memory while the
-          current page is being consumed, using \texttt{cp.async}.
+    \item contiguous reads of the paged KV cache through
+          vectorised loads---\texttt{ldmatrix} or a $128$-bit
+          \texttt{ld.global};
+    \item a block-level reduction of the softmax numerator and
+          denominator in shared memory, with a single global
+          atomic for the cross-block merge;
+    \item a warp-specialised schedule in which one warp drives
+          the loads and another drives the MMA;
+    \item prefetching the next page into shared memory, using
+          \texttt{cp.async}, while the current page is still
+          being consumed.
 \end{itemize}
-The effective arithmetic intensity of decode attention at KV length
-$L$ is
+At KV length $L$, the effective arithmetic intensity of the
+decode attention kernel is
 \begin{equation}
     I_{\text{decode}}(L) = \frac{2 L d}{L d \cdot 2 + L \cdot 4}
                          \approx 1\ \text{FLOP/byte},
 \end{equation}
-which places the kernel firmly in the memory-bound regime of the
-roofline: decode throughput is proportional to the HBM bandwidth and
-inversely proportional to $L$.
+which lands the kernel solidly in the memory-bound region of the
+roofline: decode throughput is proportional to the available HBM
+bandwidth and inversely proportional to $L$.
 
 \subsection{Prefill Attention Kernel}\label{sec:sglang_prefill}
-Prefill uses a Flash-Attention-style kernel driven by CuTe tiles
-(Section~\ref{sec:cute_layouts}). The Sliding Window Flash Attention
-of Chapter~\ref{ch:swfa} plugs in here: whenever the model declares a
-local window, the classification step skips the fully-outside blocks
-and the effective sequence length drops from $N$ to $w$. Because
-prefill is compute-bound, the block-skip ratio translates directly
-into kernel wall-clock time savings.
+Prefill is driven by a Flash-Attention-style kernel built on top
+of CuTe tiles (Section~\ref{sec:cute_layouts}). The Sliding
+Window Flash Attention of Chapter~\ref{ch:swfa} slots in at this
+point: once a model declares a local window, the classifier
+discards the fully-outside blocks, and the effective sequence
+length seen by the kernel shrinks from $N$ down to $w$. Because
+prefill is compute-bound, the block-skip ratio converts
+one-for-one into kernel wall-clock savings.
 
 \subsection{Fused Sampling Kernel}\label{sec:sglang_sampling}
-Top-$k$/top-$p$ sampling is often launched as several small kernels
-(argsort, prefix sum, masking). We fuse them into a single kernel
-that:
+In most stacks, top-$k$ and top-$p$ sampling are launched as a
+chain of several small kernels---an argsort, a prefix sum, and a
+masking step. We collapse the entire pipeline into a single
+kernel that:
 \begin{itemize}
-    \item performs a warp-wide radix partition to find the top-$k$
-          candidates;
-    \item runs a one-pass inclusive prefix sum to accumulate the
-          softmax;
+    \item performs a warp-wide radix partition to locate the
+          top-$k$ candidates;
+    \item runs a single-pass inclusive prefix sum to build up the
+          softmax denominator;
     \item samples a token using a cooperative thread-block RNG
           (Philox-32-10).
 \end{itemize}
-The fused kernel removes $3$--$4$ HBM round-trips per token, and
-because each HBM round-trip at $L = 8192$ costs $\approx 30\mu$s, the
-saving is substantial on high-request-rate workloads.
+Fusing these operations eliminates three to four HBM round-trips
+per generated token, and because one HBM round-trip at $L = 8192$
+costs roughly $30\,\mu$s, the saving is substantial on
+high-request-rate workloads.
 
 \subsection{Batching and Continuous Scheduling}\label{sec:sglang_sched}
-SGLang uses \emph{continuous batching}: a request may join the batch
-at any decode step. The kernel layer must therefore:
+SGLang implements \emph{continuous batching}: a new request can
+join the batch at any decode step. The kernel layer therefore has
+to:
 \begin{itemize}
-    \item handle variable-length sequences with an offset/length
-          array instead of a padded tensor;
-    \item support dynamic page-table reallocation without CUDA graph
-          re-capture;
-    \item cooperate with a host-side scheduler that decides which
-          requests to include in the next iteration, subject to a
-          memory budget on the paged KV cache.
+    \item accept variable-length sequences through an
+          offset/length array rather than a padded tensor;
+    \item permit the page table to be reallocated on the fly
+          without triggering a CUDA-graph re-capture;
+    \item cooperate with a host-side scheduler that decides, at
+          every iteration and subject to the paged KV-cache
+          memory budget, which requests to include.
 \end{itemize}
-The per-request offsets are passed as a \texttt{cumsum} tensor so that
-each block can locate its own starting position in $O(1)$.
+The per-request offsets reach the kernel as a \texttt{cumsum}
+tensor, so that each block can locate its own starting position
+in $O(1)$.
 
 \section{Public Baselines from the Prior Art}\label{sec:sglang_public_baselines}
 
-Before turning to the methodology of our own measurements, it is
-useful to anchor the discussion against numbers that the open
-literature has already published. These are reproduced from the
-original system papers and are used later in
-Section~\ref{sec:sglang_results} as an external reference point;
-all of them are runtime-level benchmarks on publicly disclosed
-hardware, and none of them are the measurements contributed by
-this thesis.
+Before describing the methodology of our own measurements, it is
+worth anchoring the discussion to numbers that are already
+published in the literature. The figures summarised below come
+from the original system papers; they are used later in
+Section~\ref{sec:sglang_results} purely as an external reference
+point. None of them are measurements contributed by this thesis---
+each one is a runtime-level benchmark on publicly disclosed
+hardware.
 
 Kwon~et~al.~\cite{vllm} report that replacing an unpaged KV cache
-with vLLM's paged design yields throughput improvements of
-$2$--$4\times$ on LLaMA-family workloads at similar batch sizes,
-with the gain dominated by eliminated fragmentation at long context.
-Zheng~et~al.~\cite{sglang} show that layering RadixAttention on top
-of the paged cache adds a further $1.3$--$6.4\times$ decode
-throughput on multi-turn chat workloads, because the shared prompt
-prefix is stored only once across the radix tree. Read together,
-these two results set the expectation that a well-engineered serving
-runtime can be two orders of magnitude faster than a naive
-decoder---an expectation that our own layered measurements in
-Section~\ref{sec:sglang_results} confirm, and that motivates the
-decomposition of the stack into independently-measurable kernel
-contributions.
+with vLLM's paged design produces throughput gains of
+$2$--$4\times$ on LLaMA-family workloads at comparable batch
+sizes; most of the gain is accounted for by the elimination of
+fragmentation at long context.
+Zheng~et~al.~\cite{sglang} show that layering RadixAttention on
+top of the paged cache adds a further $1.3$--$6.4\times$ of decode
+throughput on multi-turn chat workloads, thanks to the shared
+prompt prefix being kept only once inside the radix tree. Taken
+together, these two results set an expectation that a
+well-engineered serving runtime can be two orders of magnitude
+faster than a naive decoder---an expectation that our own layered
+measurements in Section~\ref{sec:sglang_results} confirm, and
+that motivates the choice to decompose the stack into
+independently measurable kernel-level contributions.
 
 \begin{table}[h]
 \centering
@@ -309,49 +325,53 @@ SGLang   & RadixAttention over paged KV      & $1.3$--$6.4\times$ decode & \cite
 \section{Methodology}\label{sec:sglang_method}
 
 \subsection{Workload}\label{sec:sglang_method_workload}
-The evaluation workload is LLaMA-7B served over a stream of
-sliding-window inference requests with window $w = 4096$ and sequence
-lengths drawn from a realistic mixture of chat and code prompts up to
-$8192$ tokens. The prefill/decode ratio is held constant across runs
-so that kernel-level changes can be attributed cleanly.
+The evaluation workload is LLaMA-7B, served over a stream of
+sliding-window inference requests with a window of $w = 4096$.
+Sequence lengths are drawn from a realistic mixture of chat and
+code prompts up to $8192$ tokens long. The prefill-to-decode ratio
+is held constant across runs so that kernel-level changes can be
+attributed cleanly to the kernel under test.
 
 \subsection{Kernels Measured}\label{sec:sglang_method_kernels}
-We measure five progressive configurations, each layered on top of the
-previous one:
+Five progressive configurations are measured, each layered on top
+of its predecessor:
 \begin{enumerate}
-    \item a baseline vanilla-attention serving stack with an unpaged
-          KV cache;
-    \item + paged KV cache (fragmentation-free, $16$-token pages);
-    \item + fused decode attention (warp-specialised load/MMA);
-    \item + SWFA prefill (Chapter~\ref{ch:swfa}, $w = 4096$);
-    \item + fused top-$k$/top-$p$ sampling.
+    \item a baseline vanilla-attention serving stack with an
+          unpaged KV cache;
+    \item $+$ paged KV cache (fragmentation-free, $16$-token
+          pages);
+    \item $+$ fused decode attention (warp-specialised load/MMA);
+    \item $+$ SWFA prefill (Chapter~\ref{ch:swfa}, $w = 4096$);
+    \item $+$ fused top-$k$/top-$p$ sampling.
 \end{enumerate}
-This layered methodology isolates the contribution of each
-optimisation.
+Layering the optimisations this way isolates the contribution of
+each individual kernel change.
 
 \subsection{Metrics}\label{sec:sglang_method_metrics}
-Decode throughput (tokens/s) is the primary metric. We also record the
-speed-up relative to the baseline, the per-request tail latency at
-the $99$th percentile, and the KV-cache footprint. Measurements are
-taken only after the runtime reaches steady state (batch fill factor
-$> 0.9$) so that warm-up effects do not contaminate the numbers.
+Decode throughput (tokens per second) is the primary metric.
+Alongside it we record the speed-up relative to the baseline, the
+$99$th-percentile per-request tail latency, and the KV-cache
+footprint. Measurements are taken only after the runtime reaches
+steady state---that is, once the batch fill factor has exceeded
+$0.9$---so that warm-up effects do not contaminate the numbers.
 
 \subsection{Hardware and Software}\label{sec:sglang_method_hw}
-All numbers are on a single A100-40GB with SGLang built against
-CUDA 11.8 and PyTorch 2.0.1, with continuous batching enabled and a
-maximum batch size of $64$ concurrent requests.
+All numbers are taken on a single A100-40GB. SGLang is built
+against CUDA~11.8 and PyTorch~2.0.1, continuous batching is
+enabled, and the maximum batch size is capped at $64$ concurrent
+requests.
 
 \section{Results}\label{sec:sglang_results}
-Table~\ref{tab:sglang_bench} reports the decode throughput after each
-optimisation. The relative gain from paged KV over the unpaged
-baseline ($1.45\times$) falls within the $2$--$4\times$ band reported
-by vLLM~\cite{vllm} once the difference in baseline implementation
-is accounted for (the baseline here includes a partially-tuned
-attention kernel that already recovers some of the
-fragmentation-free benefit that vLLM's baseline lacked). The
-cumulative $2.84\times$ gain at the end of the layered stack is
-consistent in magnitude with the improvements that SGLang reports on
-its own chat-style workloads~\cite{sglang}.
+Table~\ref{tab:sglang_bench} records the decode throughput after
+each additional layer of optimisation. The $1.45\times$ gain from
+adding the paged KV cache to the unpaged baseline sits at the low
+end of the $2$--$4\times$ band that vLLM~\cite{vllm} reports, and
+the gap is explained by the difference in baseline: our baseline
+already includes a partially tuned attention kernel that recovers
+some of the fragmentation-free benefit that vLLM's baseline did
+not have. The cumulative $2.84\times$ gain at the top of the
+stack is of the same magnitude as the improvements that SGLang
+reports on its own chat-style workloads~\cite{sglang}.
 
 \begin{table}[h]
 \centering
@@ -371,10 +391,10 @@ Baseline (vanilla attention, unpaged KV)      &  980 & 1.00$\times$ \\
 \end{table}
 
 \subsection{Tail Latency}\label{sec:sglang_tail}
-Throughput is only meaningful if it does not come at the cost of
-unreasonable tail latency. Table~\ref{tab:sglang_tail} reports the
-p50 and p99 per-token decode latency for the fully-optimised
-configuration at various batch sizes.
+Throughput only matters if it is not achieved at the expense of
+an unacceptable tail. Table~\ref{tab:sglang_tail} therefore
+reports the p50 and p99 per-token decode latency for the
+fully-optimised configuration across a range of batch sizes.
 
 \begin{table}[h]
 \centering
@@ -394,69 +414,79 @@ configuration at various batch sizes.
 \end{tabular}
 \end{table}
 
-The p99 latency stays under $30$\,ms even at batch $64$, comfortably
-below the typical $100$\,ms SLO for interactive LLM serving.
+The p99 latency stays below $30$\,ms even at a batch size of
+$64$, which is comfortably inside the usual $100$\,ms SLO for
+interactive LLM serving.
 
 \subsection{KV-Cache Footprint}\label{sec:sglang_kv_footprint}
-Paged KV cache and radix-tree sharing together reduce the memory
-footprint of a $64$-request batch at $L = 8192$ from $34$\,GB (unpaged,
-no sharing) to $19$\,GB (paged, average shared prefix $1024$ tokens),
-a $44\%$ saving that directly translates into the ability to run
-$1.7\times$ more concurrent requests per GPU at the same context
-length.
+Paged KV cache and radix-tree sharing together drop the memory
+footprint of a $64$-request batch at $L = 8192$ from $34$\,GB
+(unpaged and unshared) to $19$\,GB (paged, with an average shared
+prefix of $1024$ tokens)---a $44\%$ reduction, which translates
+directly into the ability to run $1.7\times$ more concurrent
+requests per GPU at the same context length.
 
 \subsection{SWFA Contribution}\label{sec:sglang_swfa_contrib}
-The jump from $1{,}860$ to $2{,}410$ tok/s (row 3 to row 4 of
-Table~\ref{tab:sglang_bench}) is entirely due to SWFA prefill. At
-$w = 4096$ and $N_{\text{prompt}}$ up to $8192$, SWFA skips
-approximately $37\%$ of the prefill attention blocks, which---because
-prefill is compute-bound---translates into a direct wall-clock
-saving. The decode kernels themselves do not change between rows 3
-and 4.
+The step from $1{,}860$ to $2{,}410$ tok/s between rows three and
+four of Table~\ref{tab:sglang_bench} is attributable entirely to
+SWFA prefill. At a window of $w = 4096$ and prompt lengths
+reaching $8192$, SWFA skips roughly $37\%$ of the prefill
+attention blocks; because prefill is compute-bound, that
+reduction appears directly as a wall-clock saving. The decode
+kernels themselves are unchanged between these two rows.
 
 \section{Discussion}\label{sec:sglang_discussion}
 
 \subsection{Why Each Layer Matters}\label{sec:sglang_why}
-The layered table makes it easy to see that each of the five
-optimisations contributes a non-trivial wedge of the total speedup.
+The layered table makes it easy to see that every one of the
+five optimisations contributes a non-trivial wedge of the total
+speedup:
 \begin{itemize}
-    \item Paged KV cache ($+45\%$): eliminates fragmentation and lets
-          the batch grow without re-copying the cache.
+    \item Paged KV cache ($+45\%$): eliminates fragmentation and
+          lets the batch grow without the cache having to be
+          re-copied.
     \item Fused decode attention ($+31\%$): matches the kernel's
-          arithmetic intensity to the HBM roofline and hides page
-          indirection behind compute.
-    \item SWFA prefill ($+30\%$): exploits the local window in the
-          model architecture; conditioned on the model having a
-          declared window, this is essentially free.
+          arithmetic intensity to the HBM roofline and hides the
+          page-table indirection behind compute.
+    \item SWFA prefill ($+30\%$): takes advantage of the local
+          window exposed by the model architecture; once the
+          model declares a window, this saving is essentially
+          free.
     \item Fused sampling ($+15\%$): removes several memory-bound
-          kernel launches from the tail of each step.
+          kernel launches from the tail of each decode step.
 \end{itemize}
-Ordering matters because each layer reveals the next bottleneck: had
-we fused sampling first, its contribution would have been less visible
-because the decode attention would still be the dominant cost.
+The ordering of the layers is not incidental: each layer exposes
+the next bottleneck. Had we, for example, fused the sampler
+first, its contribution would have looked smaller---decode
+attention would still have been the dominant cost.
 
 \subsection{Interaction with Continuous Batching}\label{sec:sglang_cb}
-Continuous batching amplifies the benefit of paged KV cache and radix
-sharing: because requests join mid-flight, the per-request KV slots
-rarely line up to contiguous regions. A bumper-paged cache absorbs
-this without the regular compaction that an unpaged allocator would
-need.
+Continuous batching magnifies the benefits of both the paged KV
+cache and the radix-tree sharing. Because requests arrive
+mid-flight, the per-request KV slots almost never land in
+contiguous regions; a bumper-paged cache absorbs that
+fragmentation naturally, while an unpaged allocator would have
+had to compact the cache periodically.
 
 \subsection{Limitations and
 Future Work}\label{sec:sglang_limits}
-The current implementation uses $16$-token pages. Larger pages
-improve the attention kernel's arithmetic intensity but increase the
-fragmentation of short prompts; an adaptive page-size policy is left
-as future work. A Triton port of the fused decode kernel is in
-progress (Chapter~\ref{ch:triton}) and will be used as a
-cross-validation of the CUTLASS numbers reported here.
+The current implementation is hard-coded to $16$-token pages.
+Larger pages would raise the arithmetic intensity of the
+attention kernel but would also waste more memory on short
+prompts through internal fragmentation; an adaptive page-size
+policy is left for future work. A Triton port of the fused
+decode kernel is in progress (Chapter~\ref{ch:triton}) and will
+be used as a cross-validation against the CUTLASS numbers
+reported here.
 
 \section{Summary}\label{sec:sglang_summary}
-SGLang kernel work shows how the same GEMM/attention abstractions
-developed for training can be re-purposed for serving once the memory-
-and scheduling-specific aspects of the decode path are respected. The
+The SGLang kernel work demonstrates that the GEMM and attention
+abstractions introduced on the training side are also the right
+starting point for serving, provided that the memory and
+scheduling idiosyncrasies of the decode path are respected. The
 cumulative $2.84\times$ decode-throughput speedup on LLaMA-7B at
-$w = 4096$ is delivered by a stack of four additive optimisations, each
-justifiable in isolation but collectively larger than any one of them.
-The next chapter describes how the remaining kernels in this stack are
-profiled and auto-tuned using Triton.
+a window of $w = 4096$ is the result of four additive
+optimisations, each defensible on its own and together larger
+than any one of them. The next chapter turns to how the
+remaining kernels in this stack are profiled and auto-tuned
+using Triton.

@@ -1,114 +1,128 @@
 \chapter{Sliding Window Flash Attention}\label{ch:swfa}
 
-\emph{Placement in the stack.} Chapter~\ref{ch:cutlass} established
-that skinny attention-score GEMMs are the single most under-utilised
-shape class in a transformer forward pass. This chapter attacks the
-same bottleneck from the algorithmic side: instead of making the
-dense kernel faster, we change the set of blocks it is asked to
-compute. The resulting Sliding Window Flash Attention (SWFA) kernel
-is the principal theoretical contribution of the thesis, and its
-correctness proof (Appendix~\ref{app:proofs_classify}) and
-closed-form optimal window (Appendix~\ref{app:proof_optw}) are the
-subject of rigorous treatment below. SWFA reappears in
-Chapter~\ref{ch:sglang} as the prefill kernel of the SGLang runtime
-and in Chapter~\ref{ch:triton} as the cross-validation target for
-the Triton port.
+\emph{Placement in the stack.} Chapter~\ref{ch:cutlass} showed
+that the skinny attention-score GEMM is the single most
+under-utilised shape class in a transformer forward pass. The
+present chapter approaches that same bottleneck, but from the
+algorithmic side rather than the kernel side: instead of trying
+to accelerate the dense kernel, we shrink the set of blocks the
+kernel is actually asked to compute. The Sliding Window Flash
+Attention (SWFA) kernel that emerges is the principal theoretical
+contribution of this thesis. Its correctness proof
+(Appendix~\ref{app:proofs_classify}) and its closed-form
+expression for the optimal window size
+(Appendix~\ref{app:proof_optw}) are treated rigorously in what
+follows. SWFA is then picked up again in two later chapters: in
+Chapter~\ref{ch:sglang} as the prefill kernel of the SGLang
+runtime, and in Chapter~\ref{ch:triton} as the cross-validation
+target of the Triton port.
 
 \section{Motivation}\label{sec:swfa_motivation}
-Attention cost grows quadratically in the sequence length $N$, and at
-the context windows used by contemporary production
-models ($N \geq 8{,}192$) it is this quadratic term that dictates
-both training throughput and decode latency. The Flash Attention
-family~\cite{dao2022flashattention,dao2023flashattention2} alleviates
-the \emph{memory} side of the quadratic cost by streaming the attention
-computation in tiles, but it continues to issue a dense GEMM for every
-$B_r \times B_c$ tile---even for tiles that the model is about to
-mask out. A large fraction of long-context models restrict attention
-to a local window on architectural
-grounds~\cite{beltagy2020longformer,zaheer2020bigbird}, permitting
-each query at position $i$ to attend only to keys in
-$[i-w_l, i+w_r]$. The theoretical cost under this restriction drops
-from $\Theta(N^2)$ to $\Theta(Nw)$ with $w = w_l + w_r + 1$, but the
-saving is not realised unless the kernel itself is window-aware.
+The cost of attention scales as $N^2$ in the sequence length, and
+at the context sizes that current production models operate at
+($N \geq 8{,}192$) it is this quadratic term that sets both the
+training throughput and the decode latency. The Flash Attention
+line of work~\cite{dao2022flashattention,dao2023flashattention2}
+relieves the \emph{memory} side of the quadratic cost by streaming
+the attention computation in tiles, but it still issues a dense
+GEMM for every $B_r \times B_c$ tile, including those that the
+model is about to mask out. Many long-context models restrict the
+attention pattern to a local window on architectural
+grounds~\cite{beltagy2020longformer,zaheer2020bigbird}, so that a
+query at position $i$ is only allowed to attend to keys in the
+range $[i - w_l,\, i + w_r]$. Under this restriction the
+asymptotic cost falls from $\Theta(N^2)$ to $\Theta(Nw)$ with
+$w = w_l + w_r + 1$, but the saving does not actually appear on
+the wall clock unless the kernel itself is aware of the window.
 
-This chapter presents \emph{Sliding Window Flash Attention} (SWFA),
-which combines Flash Attention's block-wise computation with an
-intelligent preprocessing step that classifies attention blocks as
-fully inside, intersecting, or fully outside the window.
-Fully-outside blocks are skipped entirely; intersecting blocks use a
-vectorised mask. The algorithm reaches up to $65.6\%$ block skipping
-on narrow windows without any numerical accuracy loss relative to
-vanilla attention.
+This chapter introduces \emph{Sliding Window Flash Attention}
+(SWFA), which combines Flash Attention's block-wise computation
+with a preprocessing step that classifies each attention block
+into one of three sets: fully inside the window, intersecting it,
+or lying entirely outside. Fully-outside blocks are never
+computed; intersecting blocks are processed with a vectorised
+mask. In practice the algorithm skips up to $65.6\%$ of the
+blocks on narrow windows, without any numerical accuracy loss
+relative to vanilla attention.
 
 \section{Background}\label{sec:swfa_background}
 
 \subsection{Flash Attention}\label{sec:fa_bg}
-Standard attention, defined by
+The standard form of attention,
 \begin{equation}
 \mathrm{Attention}(Q, K, V) =
 \mathrm{softmax}\!\left(\frac{Q K^{\!\top}}{\sqrt{d}}\right) V ,
 \end{equation}
-is written in three operations---score, softmax, output---that naturally
-produce an $N \times N$ score matrix as an intermediate. The observation
-behind Flash Attention is that this matrix is only used as an input to
-the softmax, and the softmax itself can be computed incrementally. If
-queries are partitioned into row tiles of height $B_r$ and keys/values
-into column tiles of width $B_c$, a running pair $(m_i, \ell_i)$ of
-row-max and row-sum is enough to re-scale previous contributions every
-time a new column tile arrives:
+is written as three operations---scores, softmax, output---and
+naturally produces an intermediate score matrix of size
+$N \times N$. The observation that drives Flash Attention is that
+this intermediate is only ever consumed by the softmax, and that
+the softmax itself can be computed on the fly. If the queries are
+partitioned into row tiles of height $B_r$ and the keys and values
+into column tiles of width $B_c$, a running pair of row-max and
+row-sum, $(m_i, \ell_i)$, is sufficient to re-scale the previously
+accumulated contributions every time a new column tile arrives:
 \begin{equation}\label{eq:online_softmax}
 m_i^{\text{new}} = \max(m_i, \max_j s_{ij}),\quad
 \ell_i^{\text{new}} = e^{m_i - m_i^{\text{new}}} \ell_i
                      + \sum_j e^{s_{ij} - m_i^{\text{new}}} ,
 \end{equation}
-and a matching correction factor is applied to the output accumulator
-$O_i$. With this rearrangement the peak HBM residency of the attention
-kernel is bounded by the tile sizes rather than by $N^2$, which
-collapses the memory footprint from quadratic to linear in the
-sequence length without changing the mathematical result up to the
-floating-point associativity of the running sum.
+A matching correction factor is then applied to the output
+accumulator $O_i$. Under this rearrangement, the peak HBM
+residency of the attention kernel depends only on the tile sizes
+rather than on $N^2$, which shrinks the memory footprint from
+quadratic to linear in the sequence length while leaving the
+mathematical result unchanged---up to the associativity of
+floating-point sums.
 
 \subsection{Sliding-Window Attention}\label{sec:sw_bg}
-A symmetric window of size $w$ only keeps attention weights within
-distance $w/2$ of the diagonal, i.e. any key position $j$ satisfying
+A symmetric window of size $w$ keeps only those attention weights
+whose key position $j$ lies within $w/2$ of the query position
+along the diagonal, i.e.\ those satisfying
 \begin{equation}\label{eq:window}
 \max(0, i - w_l) \leq j \leq \min(N-1, i + w_r).
 \end{equation}
-Existing implementations apply this constraint as an element-wise mask
-\emph{after} computing the attention scores---wasteful, because entire
-$B_r \times B_c$ blocks are sometimes completely outside the band.
-Naive masking incurs the full $\mathcal{O}(N^2)$ FLOP cost; SWFA
-reduces it to $\mathcal{O}(Nw)$ by skipping the dense computation on
-fully-outside blocks.
+In existing implementations, this constraint is applied as an
+element-wise mask \emph{after} the attention scores have been
+computed---wasteful, because entire $B_r \times B_c$ blocks can
+sit outside the band and still pay the full dense GEMM cost. The
+naive masking approach therefore incurs the full
+$\mathcal{O}(N^2)$ FLOP bill; SWFA brings it down to
+$\mathcal{O}(Nw)$ by declining to compute the dense operation for
+blocks that lie fully outside the window.
 
 \section{Method}\label{sec:swfa_method}
 
 \subsection{Block Classification}\label{sec:swfa_classify}
-Given $N$, block sizes $(B_r, B_c)$, and window parameters
-$(w_l, w_r)$, partition the attention matrix into $T_r \times T_c$
-blocks, where
+Given a sequence length $N$, block sizes $(B_r, B_c)$, and the
+window parameters $(w_l, w_r)$, the attention matrix is first
+partitioned into a $T_r \times T_c$ grid of blocks with
 \begin{equation}
 T_r = \left\lceil \frac{N}{B_r} \right\rceil, \qquad
 T_c = \left\lceil \frac{N}{B_c} \right\rceil .
 \end{equation}
-Each block $(r, c)$ is classified into one of three sets:
+Each block $(r, c)$ then falls into exactly one of three sets:
 \begin{description}
-    \item[$\mathcal{I}$ (fully inside).] All $(q, k)$ pairs in the
-          block satisfy~\eqref{eq:window}; no masking required.
-    \item[$\mathcal{X}$ (intersecting).] Some pairs satisfy the
-          constraint and some do not; a per-position mask is required.
-    \item[$\mathcal{O}$ (fully outside).] No pair satisfies the
-          constraint; the block is skipped.
+    \item[$\mathcal{I}$ (fully inside).] Every $(q, k)$ pair in
+          the block satisfies~\eqref{eq:window}; no mask is
+          needed.
+    \item[$\mathcal{X}$ (intersecting).] Some pairs in the block
+          satisfy the constraint and others do not; a
+          per-position mask is required.
+    \item[$\mathcal{O}$ (fully outside).] No pair in the block
+          satisfies the constraint, and the block is skipped
+          altogether.
 \end{description}
 
-Figure~\ref{fig:swfa_classify} visualises the three block classes on
-an $8 \times 8$ attention grid for $w_l = w_r = 2$ (so $B_r = B_c = 1$
-position per block for clarity). The inside set $\mathcal{I}$ occupies
-a narrow band around the diagonal, the intersecting set $\mathcal{X}$
-runs along its boundary, and the outside set $\mathcal{O}$ covers the
-remainder of the grid; only blocks in $\mathcal{I} \cup \mathcal{X}$
-enter the kernel loop, and $\mathcal{X}$ alone needs the vectorised
-mask of Algorithm~\ref{alg:swfa_mask}.
+Figure~\ref{fig:swfa_classify} illustrates these three classes on
+an $8 \times 8$ attention grid with $w_l = w_r = 2$, using
+$B_r = B_c = 1$ for clarity. The inside set $\mathcal{I}$ occupies
+a narrow band centred on the diagonal, the intersecting set
+$\mathcal{X}$ runs along the boundary of that band, and the
+outside set $\mathcal{O}$ covers everything else. Only the blocks
+in $\mathcal{I} \cup \mathcal{X}$ ever enter the kernel loop, and
+of those, only the $\mathcal{X}$ blocks actually need the
+vectorised mask produced by Algorithm~\ref{alg:swfa_mask}.
 
 \begin{figure}[H]
     \centering
@@ -233,10 +247,11 @@ $[0, N-1]$ does not affect the inequalities because the window
 intersected with $[0, N-1]^2$ is a subset of the unclipped band.
 \end{proof}
 
-Lemma~\ref{lem:corner} justifies the $\mathcal{O}(T_r T_c)$ classifier:
-only four corner checks are required per block, giving an
-$\mathcal{O}((N/B)^2)$ classification cost that is dominated by the
-$\mathcal{O}(N w / B)$ cost of the non-skipped blocks.
+This lemma is what justifies the $\mathcal{O}(T_r T_c)$
+classifier: only four corner checks per block are required,
+producing an $\mathcal{O}((N/B)^2)$ classification cost that is
+in practice dominated by the $\mathcal{O}(Nw/B)$ cost of the
+non-skipped blocks themselves.
 
 \subsection{Vectorised Mask Generation}\label{sec:swfa_mask}
 For a block $(r, c)$, define the block diagonal offset
@@ -331,19 +346,21 @@ the Flash Attention online softmax on top of the block classification.
 \end{algorithm}
 
 \subsection{Backward Pass}\label{sec:swfa_backward}
-The backward pass uses the fact that the online softmax keeps only
-$(m_r, \ell_r, O_r)$ per row block. To recompute the softmax during
-backpropagation, we re-run the forward loop with the same block
-classification, but this time we
-(i) recompute $S_{rc}$ on the fly;
-(ii) use the stored $(m_r, \ell_r)$ to obtain $P_{rc}$;
-(iii) compute $\mathrm{d}V_c \mathrel{+}= P_{rc}^{\top}\,\mathrm{d}O_r$,
-$\mathrm{d}P_{rc} = \mathrm{d}O_r V_c^{\top}$,
-$\mathrm{d}S_{rc} = P_{rc} \odot (\mathrm{d}P_{rc} - \rho_r)$ where
-$\rho_r = \sum_c P_{rc} \odot \mathrm{d}P_{rc}$.
-Outside blocks are skipped because their forward contribution is zero;
-intersecting blocks reapply the same mask. Pseudocode is given in
-Algorithm~\ref{alg:swfa_backward}.
+The backward pass exploits the fact that the online softmax
+stores only the triple $(m_r, \ell_r, O_r)$ per row block. To
+recompute the softmax at backpropagation time, the forward loop
+is replayed with the same block classification, but this time:
+(i) the score $S_{rc}$ is recomputed on the fly;
+(ii) the stored $(m_r, \ell_r)$ are used to recover $P_{rc}$;
+(iii) the following updates are accumulated,
+$\mathrm{d}V_c \mathrel{+}= P_{rc}^{\top}\,\mathrm{d}O_r$,
+$\mathrm{d}P_{rc} = \mathrm{d}O_r V_c^{\top}$, and
+$\mathrm{d}S_{rc} = P_{rc} \odot (\mathrm{d}P_{rc} - \rho_r)$
+with $\rho_r = \sum_c P_{rc} \odot \mathrm{d}P_{rc}$.
+Outside blocks contribute nothing to the forward output and can
+therefore be skipped in the backward pass as well; intersecting
+blocks reapply the same mask as in the forward pass. The full
+pseudocode is given in Algorithm~\ref{alg:swfa_backward}.
 
 \begin{algorithm}[h]
     \caption{Sliding Window Flash Attention (backward pass).}
@@ -376,33 +393,39 @@ Algorithm~\ref{alg:swfa_backward}.
     \Return $\mathrm{d}Q, \mathrm{d}K, \mathrm{d}V$\;
 \end{algorithm}
 
-The backward pass visits the same block set as the forward pass, so
-its speedup factor over vanilla backward is identical: up to $65.6\%$
-skipped blocks on narrow windows.
+Because the backward pass visits exactly the same set of blocks
+as the forward pass, its speedup factor relative to the vanilla
+backward is identical---up to $65.6\%$ of blocks skipped on
+narrow windows.
 
 \subsection{Complexity}\label{sec:swfa_complexity}
-For a sequence of length $N$, window $w$, and block size $B$:
+For a sequence of length $N$, a window of size $w$, and a block
+size of $B$:
 \begin{itemize}
-    \item Total blocks: $(N/B)^2$.
-    \item Blocks inside the band: $\approx 2 (N/B)(w/B)$.
-    \item Blocks skipped: $(N/B)^2 - 2(N/B)(w/B)$, giving a
-          theoretical speed-up of $1 - \tfrac{2w}{N}$ when $w \ll N$.
+    \item The total block count is $(N/B)^2$.
+    \item The number of blocks inside the band is approximately
+          $2(N/B)(w/B)$.
+    \item The number of skipped blocks is therefore
+          $(N/B)^2 - 2(N/B)(w/B)$, yielding a theoretical
+          speed-up of $1 - \tfrac{2w}{N}$ in the regime
+          $w \ll N$.
 \end{itemize}
-For $N=128$, $w=4$, $B=16$, $48$ of $64$ blocks ($75\%$) are skipped.
-The memory footprint matches Flash Attention's $\mathcal{O}(N)$. A
-formal block-count lemma is given in Appendix~\ref{app:proofs_block}.
+For $N = 128$, $w = 4$, $B = 16$, this gives $48$ of $64$
+blocks skipped ($75\%$). The memory footprint of SWFA coincides
+with Flash Attention's $\mathcal{O}(N)$. A formal block-count
+lemma is provided in Appendix~\ref{app:proofs_block}.
 
 \section{Correctness and Performance}\label{sec:swfa_results}
 
 \subsection{Setup}\label{sec:swfa_setup}
-The kernel is implemented in PyTorch 2.0 with CPU-optimised paths;
-numerical validation is carried out against a vanilla attention
-reference on an Intel Xeon Platinum 8358 host over $19$ configurations
-with a fixed random seed. The reference implementation uses the
-standard PyTorch \texttt{scaled\_dot\_product\_attention} path with a
-boolean mask, so that both implementations share the same arithmetic
-up to the order-of-operations difference introduced by the block
-streaming.
+The SWFA kernel is implemented in PyTorch~2.0 with CPU-optimised
+paths. Numerical validation is performed on an Intel Xeon Platinum
+8358 host, against a vanilla attention reference, across $19$
+configurations and a fixed random seed. The reference uses the
+standard \texttt{scaled\_dot\_product\_attention} path with a
+boolean mask, so that both implementations share the same
+underlying arithmetic---the only difference between them being the
+order in which block-streamed additions are performed.
 
 \subsection{Numerical Accuracy}\label{sec:swfa_accuracy}
 \begin{table}[h]
@@ -427,10 +450,11 @@ Window $>$ sequence ($w{=}20,20$)       & $4.2\mathrm{e}{-7}$ & $4.0\mathrm{e}{-
 \end{tabular}
 \end{table}
 
-All $19$ configurations pass within the specified tolerance; float-32
-results are within sub-microsecond precision of the reference. The FP16
-row uses the looser $10^{-2}$ tolerance that matches the accumulated
-round-off budget of an $N \times N$ sum in FP16.
+Every one of the $19$ configurations clears the specified
+tolerance; the FP32 results are within sub-microsecond precision of
+the reference. The FP16 row uses the looser $10^{-2}$ tolerance,
+which matches the accumulated round-off budget of an $N \times N$
+sum in FP16.
 
 \subsection{Block-Skip Efficiency}\label{sec:swfa_blocks}
 \begin{table}[h]
@@ -455,15 +479,16 @@ Window $>$ sequence          & 16 &  0 &  0.0\% & Full cover \\
 \end{tabular}
 \end{table}
 
-Narrow windows yield the largest savings: up to $65.6\%$ of blocks are
-skipped entirely, as predicted by the theoretical analysis of
-Section~\ref{sec:swfa_complexity}.
+The largest savings appear under narrow windows: up to $65.6\%$ of
+blocks are skipped outright, which matches the theoretical analysis
+of Section~\ref{sec:swfa_complexity}.
 
 \subsection{Ablation: Block Size vs.\ Window Size}\label{sec:swfa_ablation}
-The savings depend on $B$ as well as on $w$. Table~\ref{tab:swfa_ablation}
-sweeps $B \in \{16, 32, 64, 128\}$ for $N = 4096$ and a symmetric
-window of $w = 512$. Smaller blocks extract more savings at the cost of
-higher kernel-launch overhead; $B = 64$ is the sweet spot on A100.
+The savings depend not only on $w$ but also on the block size $B$.
+Table~\ref{tab:swfa_ablation} sweeps $B \in \{16, 32, 64, 128\}$
+for $N = 4096$ and a symmetric window of $w = 512$. Smaller
+blocks expose more skip opportunities but incur more kernel-launch
+overhead; on the A100 the sweet spot sits at $B = 64$.
 
 \begin{table}[h]
 \centering
@@ -483,10 +508,11 @@ higher kernel-launch overhead; $B = 64$ is the sweet spot on A100.
 \end{table}
 
 \subsection{End-to-End Integration}\label{sec:swfa_e2e}
-When combined with the distributed-training backends of
-Chapter~\ref{ch:distributed}, SWFA delivers the following end-to-end
-results on a GPT-2 Medium model with local window
-$w_l = w_r = 512$, sequence length $2048$, and batch size $4$ per GPU:
+Plugged into the distributed-training backends of
+Chapter~\ref{ch:distributed}, SWFA delivers the end-to-end
+results reported below on a GPT-2 Medium model with local window
+$w_l = w_r = 512$, sequence length $2048$, and a per-GPU batch
+size of four:
 
 \begin{table}[h]
 \centering
@@ -506,15 +532,17 @@ DeepSpeed + SWFA                & 19\,850 &  9.8 & 24.7 & 2.0 \\
 \end{tabular}
 \end{table}
 
-SWFA gives a $50$--$59\%$ throughput improvement over vanilla attention
-without additional memory overhead or measurable accuracy loss. The
-perplexity difference of $0.1$ is within the run-to-run noise of
-GPT-2 Medium and does not persist across seeds.
+SWFA delivers a throughput improvement in the $50$--$59\%$ range
+over vanilla attention, without additional memory overhead and
+without measurable accuracy loss. The $0.1$ gap in perplexity
+sits within the run-to-run noise of GPT-2 Medium and does not
+persist across seeds.
 
 \subsection{Long-Sequence Scaling}\label{sec:swfa_long_seq}
-Figure~\ref{fig:swfa_scale} shows how the speed-up grows with the
-sequence length at a fixed window $w = 512$, consistent with the
-theoretical $\Theta(N/w)$ scaling.
+Figure~\ref{fig:swfa_scale} shows the speed-up as a function of
+the sequence length, with the window held fixed at $w = 512$.
+The curve is consistent with the theoretical $\Theta(N/w)$
+scaling.
 
 \begin{figure}[H]
 \centering
@@ -539,21 +567,23 @@ theoretical $\Theta(N/w)$ scaling.
 \section{Optimal Window Size}\label{sec:swfa_optimal}
 
 \subsection{Cost Model}\label{sec:swfa_cost}
-The total cost of using a sliding window is modelled as
+The total cost of using a sliding window of size $w$ is modelled
+as
 \begin{equation}\label{eq:loss}
 \mathcal{L}(w) = \alpha\, C(w) + \beta\, M(w) + \gamma\, P(w),
 \end{equation}
-with
+where the individual terms are
 \begin{align*}
 C(w) &= \kappa N w d & \text{(computation, seconds)} \\
-M(w) &\approx M_0    & \text{(memory, constant in $w$)} \\
+M(w) &\approx M_0    & \text{(memory, essentially constant in $w$)} \\
 P(w) &= \frac{2 N A_0 e^{-\lambda w/2}}{1 - e^{-\lambda}}
-                    & \text{(performance loss, dimensionless)}
+                    & \text{(accuracy loss, dimensionless)}.
 \end{align*}
-where the performance term assumes an exponential attention-decay
-model $A_{ij} = A_0 e^{-\lambda|i-j|}$ and the computation term uses
-the $\kappa$ seconds-per-FLOP constant of the underlying GEMM kernel.
-The empirical justification for $A_{ij} = A_0 e^{-\lambda|i-j|}$ is in
+The accuracy term is derived under the exponential attention-decay
+model $A_{ij} = A_0 e^{-\lambda|i-j|}$, and the computation term
+uses the seconds-per-FLOP constant $\kappa$ of the underlying GEMM
+kernel. The empirical evidence supporting
+$A_{ij} = A_0 e^{-\lambda|i-j|}$ is deferred to
 Appendix~\ref{app:proof_decay}.
 
 \subsection{Convexity}\label{sec:swfa_convex}
@@ -594,22 +624,23 @@ details of the boundary projection onto $[1, N-1]$, is given in
 Appendix~\ref{app:proof_optw}.
 \end{proof}
 
-In practice, $w^{\star}$ must be projected onto $[1, N-1]$.
-Corollaries follow immediately: $w^{\star} \uparrow$ as
-$\alpha \downarrow$ (cheap compute); $w^{\star} \downarrow$ as
-$\gamma \downarrow$ (accuracy matters less); $w^{\star}$ decreases as
-the embedding dimension $d$ grows because each token becomes more
-informative.
+In practice $w^{\star}$ has to be projected onto $[1, N-1]$.
+Three corollaries are immediate: $w^{\star}$ grows as $\alpha$
+shrinks (cheaper compute favours a wider window); it shrinks as
+$\gamma$ shrinks (when accuracy matters less, a narrower window
+suffices); and it shrinks as the embedding dimension $d$ grows,
+because each token then carries more information on its own.
 
 \subsection{Sensitivity Analysis}\label{sec:swfa_sensitivity}
-Table~\ref{tab:swfa_sensitivity} reports $w^\star$ for a grid of
-cost-model parameters, assuming $N = 4096$, $d = 128$, $\kappa$ fixed
-at the A100 A100 FP16 GEMM rate, and $A_0 = 1$. Realistic values of
-the decay rate $\lambda$ lie in $[0.01, 0.05]$, and realistic cost
-ratios $\gamma/\alpha$ in $[10, 1000]$; the resulting optimal windows
-fall between $128$ and $2048$, aligning with the window choices used
-in Mistral-7B ($w = 4096$ as a safety margin) and Gemma-7B
-($w = 4096$).
+Table~\ref{tab:swfa_sensitivity} lists $w^\star$ over a grid of
+cost-model parameters, with $N = 4096$, $d = 128$, $\kappa$
+pinned at the A100 FP16 GEMM rate, and $A_0 = 1$. Realistic
+values for the decay rate $\lambda$ lie in $[0.01, 0.05]$ and
+realistic cost ratios $\gamma/\alpha$ in $[10, 1000]$. The
+optimal windows resulting from these ranges fall between $128$
+and $2048$, which aligns closely with the window choices adopted
+by Mistral-7B and Gemma-7B (both use $w = 4096$ as a safety
+margin).
 
 \begin{table}[h]
 \centering
@@ -629,18 +660,22 @@ $\lambda$ & $\gamma/\alpha = 10$ & $100$ & $1\,000$ & $10\,000$ \\
 \end{table}
 
 \section{Summary}\label{sec:swfa_summary}
-SWFA combines Flash Attention's streaming block computation with an
-explicit block-sparsity step, yielding:
+SWFA fuses Flash Attention's streaming block computation with an
+explicit block-sparsity step. The end result is:
 \begin{itemize}
-    \item up to $65.6\%$ reduction in computed attention blocks;
-    \item sub-$10^{-4}$ error against the reference attention;
-    \item $50$--$59\%$ end-to-end training throughput improvement on
-          GPT-2-Medium when used with DeepSpeed/FSDP;
-    \item a closed-form optimal window size under an exponential
-          decay model, with a strictly convex loss that admits a
-          unique minimiser.
+    \item up to a $65.6\%$ reduction in the number of attention
+          blocks that are actually computed;
+    \item numerical error below $10^{-4}$ against the vanilla
+          reference;
+    \item a $50$--$59\%$ improvement in end-to-end training
+          throughput on GPT-2-Medium when paired with DeepSpeed or
+          FSDP;
+    \item a closed-form expression for the optimal window size
+          under an exponential decay model, together with a
+          strictly convex loss that guarantees a unique
+          minimiser.
 \end{itemize}
-Remaining work includes a CUDA/Triton port (sketched in
-Chapter~\ref{ch:triton}), an efficient backward-pass kernel
-(Algorithm~\ref{alg:swfa_backward}), and integration into the serving
-stack of Chapter~\ref{ch:sglang}.
+The remaining work consists of a CUDA/Triton port (sketched in
+Chapter~\ref{ch:triton}), a more carefully tuned
+backward-pass kernel (Algorithm~\ref{alg:swfa_backward}), and
+integration into the serving stack of Chapter~\ref{ch:sglang}.

@@ -1,42 +1,47 @@
 \chapter{Triton Kernel Profiling and Auto-tuning}\label{ch:triton}
 
-\emph{Placement in the stack.} This chapter closes the loop. Every
-earlier chapter produced a number: a throughput, a memory footprint, a
-block-skip ratio, a decode speedup. Unless those numbers can be
-reproduced by an independent implementation, they are not yet
-engineering evidence. The pipeline described here takes every
-kernel that was introduced in Chapters~\ref{ch:cutlass}--\ref{ch:sglang}
-and re-implements it in Triton, measures it on the same hardware, and
-reports whether the two implementations agree to within the
-specified tolerance. The feedback arrow from this chapter to
-Chapter~\ref{ch:distributed} in Fig.~\ref{fig:intro_stack} is
-deliberate: the shape-indexed auto-tune cache developed in this
-chapter is what lets the distributed-training recommendations of
-Chapter~\ref{ch:distributed} remain valid as the input shape and the
-hardware generation change.
+\emph{Placement in the stack.} The role of this chapter is to
+close the loop. Every earlier chapter produced at least one
+number---a throughput, a memory footprint, a block-skip ratio, a
+decode speed-up---and none of those numbers qualify as engineering
+evidence until an independent implementation reproduces them. The
+pipeline described in the remainder of this chapter takes every
+kernel introduced in Chapters~\ref{ch:cutlass} through
+\ref{ch:sglang}, re-implements it in Triton, re-measures it on
+the same hardware, and verifies that the two implementations
+agree inside the stated tolerance. The dashed feedback arrow
+running from this chapter back to Chapter~\ref{ch:distributed} in
+Fig.~\ref{fig:intro_stack} is therefore deliberate: the
+shape-indexed auto-tune cache built here is exactly what lets the
+distributed-training recommendations of
+Chapter~\ref{ch:distributed} continue to hold as the input
+shapes and the underlying hardware change over time.
 
-This chapter describes the final layer of the software stack: a
-Triton-based profiling and auto-tuning pipeline that ties together
-the CUTLASS GEMM work of Chapter~\ref{ch:cutlass}, the attention
-kernels of Chapters~\ref{ch:swfa} and~\ref{ch:sglang}, and the
-distributed-training measurements of Chapter~\ref{ch:distributed}.
-The pipeline serves two complementary purposes: it provides a uniform
-measurement surface across Triton, CUTLASS, and Torch-inductor
-implementations of the same kernel, and it contains an auto-tuner that
-selects block sizes, warp counts, and pipeline depths as a function of
-the input shape and data type.
+What the present chapter contributes, then, is the final layer of
+the software stack: a Triton-based profiling and auto-tuning
+pipeline that ties together the CUTLASS GEMM study of
+Chapter~\ref{ch:cutlass}, the attention kernels of
+Chapters~\ref{ch:swfa} and \ref{ch:sglang}, and the
+distributed-training numbers of Chapter~\ref{ch:distributed}. Two
+purposes sit behind this pipeline: it provides a single,
+uniform measurement surface across Triton, CUTLASS, and
+Torch-inductor implementations of the same kernel, and it
+contains an auto-tuner that selects block sizes, warp counts, and
+pipeline depths as functions of the input shape and data type.
 
 \section{Triton Programming Model}\label{sec:triton_model}
-Triton~\cite{tillet2019triton} is a Python-embedded DSL for writing
-GPU kernels. A Triton program operates at the \emph{tile} level---%
-unlike CUDA, where the programmer reasons about individual threads,
-Triton exposes \texttt{tl.load}/\texttt{tl.store} on blocks and leaves
-register allocation, shared-memory partitioning, and vectorisation to
-the compiler. This makes Triton an attractive complement to CUTLASS
-for rapid experimentation with GEMM, attention, and element-wise
-fusion.
+Triton~\cite{tillet2019triton} is a Python-embedded domain-specific
+language for writing GPU kernels. Its programs operate at the
+\emph{tile} level: where CUDA forces the programmer to think in
+terms of individual threads, Triton exposes
+\texttt{tl.load}/\texttt{tl.store} on entire blocks and hands off
+register allocation, shared-memory partitioning, and vectorisation
+to its own compiler. This makes Triton a natural complement to
+CUTLASS for rapid experimentation with GEMMs, attention kernels,
+and element-wise fusions.
 
-A minimal Triton GEMM kernel illustrates the model:
+The following minimal GEMM kernel illustrates the programming
+model:
 \begin{lstlisting}[language=Python,basicstyle=\ttfamily\scriptsize]
 @triton.jit
 def matmul_kernel(A_ptr, B_ptr, C_ptr, M, N, K,
@@ -55,74 +60,83 @@ def matmul_kernel(A_ptr, B_ptr, C_ptr, M, N, K,
         acc += tl.dot(a, b)
     tl.store(C_ptr + offs_m[:, None]*N + offs_n[None, :], acc)
 \end{lstlisting}
-The \texttt{tl.constexpr} annotation marks parameters that are
-propagated through the Triton compiler as compile-time constants, so
-each $(B_m, B_n, B_k)$ triple becomes a separate kernel binary.
+The \texttt{tl.constexpr} annotation marks parameters that the
+Triton compiler propagates as compile-time constants, so every
+distinct $(B_m, B_n, B_k)$ triple is compiled to a separate
+kernel binary.
 
 \section{Methodology}\label{sec:triton_method}
 
 \subsection{Profiling Pipeline}\label{sec:triton_pipeline}
-The profiling pipeline built for this thesis consists of four layers,
-each addressing a distinct question about a candidate kernel.
+The profiling pipeline developed for this thesis is made up of
+four layers, each of which answers a different question about a
+candidate kernel.
 \begin{enumerate}
-    \item \textbf{Timing harness.} Each kernel is wrapped in a
-          warmup/steady loop with CUDA events so that launch
-          overhead is removed. Every configuration is repeated enough
-          times for the standard deviation of the measured latency to
-          fall below $1\%$.
-    \item \textbf{Roofline analysis.} Arithmetic intensity is
-          computed from the kernel's FLOP count and HBM traffic; the
-          result is compared to the A100's roofline
-          (FP16: $312$\,TFLOP/s, HBM: $1555$\,GB/s) to decide whether
-          the kernel is compute- or memory-bound.
-    \item \textbf{Nsight Compute cross-check.} For kernels that
-          deviate significantly from the roofline, \texttt{ncu}
-          provides occupancy, cache-hit, and stall breakdowns so that
-          the root cause can be attributed to a specific hardware
-          unit.
+    \item \textbf{Timing harness.} Every kernel is wrapped in a
+          warm-up / steady-state loop timed with CUDA events, so
+          that kernel-launch overhead is excluded. Every
+          configuration is repeated until the relative standard
+          deviation of the measured latency falls below $1\%$.
+    \item \textbf{Roofline analysis.} The kernel's arithmetic
+          intensity is obtained from its FLOP count and HBM
+          traffic, and is then compared against the A100's
+          roofline ($312$\,TFLOP/s in FP16, $1{,}555$\,GB/s HBM)
+          to decide whether the kernel is compute-bound or
+          memory-bound.
+    \item \textbf{Nsight Compute cross-check.} For any kernel
+          that deviates meaningfully from its predicted roofline,
+          \texttt{ncu} is used to extract occupancy, cache-hit
+          rates, and stall breakdowns so that the root cause can
+          be localised to a specific hardware unit.
     \item \textbf{Auto-tuning.} Triton's built-in \texttt{autotune}
-          iterates over block-size / num-warps / num-stages
-          combinations; the best configuration is cached on disk keyed
-          by input shape and data type.
+          mechanism sweeps over block sizes, warp counts, and
+          pipeline depths, and the winning configuration is
+          serialised to disk with a key that includes the input
+          shape and data type.
 \end{enumerate}
 
 \subsection{Kernels Under Study}\label{sec:triton_kernels}
-The pipeline is exercised on four representative kernels:
+Four kernels, each representative of a recurring shape class in
+an LLM, are put through the pipeline:
 \begin{itemize}
-    \item a dense GEMM of shape $4096 \times 4096 \times 4096$ (MLP
-          projection);
-    \item a Flash Attention forward pass at sequence length $2048$;
-    \item the Sliding Window Flash Attention forward at sequence
-          length $2048$ and window $512$
+    \item a dense GEMM of shape $4096 \times 4096 \times 4096$
+          (an MLP projection);
+    \item a Flash Attention forward pass at sequence length
+          $2048$;
+    \item the Sliding Window Flash Attention forward pass at
+          sequence length $2048$ and window $w = 512$
           (Chapter~\ref{ch:swfa});
     \item the SGLang decode-attention kernel at KV length $8192$
           (Chapter~\ref{ch:sglang}).
 \end{itemize}
-Each is implemented three times (Triton, CUTLASS, Torch-inductor) so
-that the comparator can cross-validate numerical accuracy and
-throughput.
+Each of these is implemented three times over---once in Triton,
+once in CUTLASS, and once in Torch-inductor---so that the
+comparator can simultaneously cross-validate numerical accuracy
+and throughput.
 
 \subsection{Auto-tune Search Space}\label{sec:triton_search}
-For each kernel, Triton's auto-tuner explores the Cartesian product
+For each kernel, Triton's auto-tuner sweeps the Cartesian product
 of:
 \begin{itemize}
     \item block sizes $(B_m, B_n, B_k) \in \{32,64,128\}^3$;
     \item warp counts $\in \{2, 4, 8\}$;
     \item pipeline stages $\in \{2, 3, 4\}$;
 \end{itemize}
-subject to the shared-memory budget of the A100 (164\,KB per SM).
-Illegal configurations are pruned analytically before the compile.
-The best configuration is serialised to a JSON cache keyed by
+constrained by the A100's $164$\,KB per-SM shared-memory budget.
+Configurations that cannot possibly satisfy this budget are
+pruned analytically before the compiler is invoked. The best
+surviving configuration is serialised to a JSON cache keyed by
 $(\text{kernel\_name}, M, N, K, \text{dtype})$.
 
 \section{Implementation}\label{sec:triton_impl}
 
 \subsection{Timing Harness}\label{sec:triton_harness}
-The timing harness uses the \texttt{torch.cuda.Event} API with the
-\texttt{enable\_timing=True} flag. Each run issues a $25$-iteration
-warmup, then times $N_{\text{rep}}$ iterations where
-$N_{\text{rep}}$ grows until the relative standard deviation drops
-below $1\%$ or a $5$-second wall-clock cap is reached:
+The timing harness relies on the \texttt{torch.cuda.Event} API
+with \texttt{enable\_timing=True}. Every run begins with a
+$25$-iteration warm-up and then proceeds to time
+$N_{\text{rep}}$ iterations, with $N_{\text{rep}}$ grown
+dynamically until either the relative standard deviation drops
+below $1\%$ or a $5$-second wall-clock cap is hit:
 \begin{lstlisting}[language=Python,basicstyle=\ttfamily\scriptsize]
 def benchmark(fn, *args, target_cv=0.01, min_iter=25, max_iter=1000):
     for _ in range(min_iter):
@@ -142,27 +156,29 @@ def benchmark(fn, *args, target_cv=0.01, min_iter=25, max_iter=1000):
 \end{lstlisting}
 
 \subsection{Roofline Computation}\label{sec:triton_roofline}
-For a kernel with $F$ FLOPs and $B$ bytes of HBM traffic, the
-arithmetic intensity is $I = F/B$; the roofline-predicted throughput
-is $P = \min(P_{\max}, I \cdot B_{\max})$. The pipeline emits both the
-predicted and the measured throughput and flags kernels that achieve
-$<\!70\%$ of the roofline for manual inspection.
+Given a kernel with $F$ FLOPs and $B$ bytes of HBM traffic, the
+arithmetic intensity is $I = F/B$, and the roofline-predicted
+throughput is $P = \min(P_{\max}, I \cdot B_{\max})$. The pipeline
+then reports both the predicted and the measured throughput, and
+flags any kernel that reaches less than $70\%$ of its roofline
+for manual inspection.
 
 \subsection{Cross-Validator}\label{sec:triton_xval}
-The cross-validator runs the same kernel in three implementations on
-the same random inputs and verifies that outputs agree within an
-ULP-weighted tolerance. Discrepancies larger than $10^{-4}$ FP32 or
-$10^{-2}$ FP16 are reported as correctness failures.
+The cross-validator runs the three implementations of a given
+kernel on the same random inputs and verifies that their outputs
+agree inside an ULP-weighted tolerance. Discrepancies above
+$10^{-4}$ in FP32 or $10^{-2}$ in FP16 are flagged as correctness
+failures.
 
 \section{Results}\label{sec:triton_results}
 
 \subsection{Kernel Throughput
 Comparison}\label{sec:triton_results_throughput}
-Table~\ref{tab:triton_benchmarks} shows the cross-implementation
-throughput in TFLOPS for each of the four kernels. All three
-implementations deliver comparable performance on the dense GEMM,
-while Triton and CUTLASS pull ahead of Torch-inductor on the attention
-kernels thanks to more aggressive fusion.
+Table~\ref{tab:triton_benchmarks} records the
+cross-implementation throughput, in TFLOPS, for each of the four
+kernels. On the dense GEMM all three implementations are roughly
+matched; on the attention kernels Triton and CUTLASS move ahead
+of Torch-inductor, owing mostly to more aggressive fusion.
 
 \begin{table}[h]
 \centering
@@ -181,16 +197,17 @@ Decode attention (KV=8K)                & 84  &  92 &  71 \\
 \end{tabular}
 \end{table}
 
-Torch-inductor does not expose a sliding-window variant of the Flash
-Attention kernel, hence the missing entry; the bracketed comparison
-therefore focuses on Triton vs.\ CUTLASS there.
+Torch-inductor does not ship a sliding-window variant of the
+Flash Attention kernel---hence the missing entry---so the
+SWFA row effectively reduces to a Triton-versus-CUTLASS
+comparison.
 
 \subsection{Roofline Placement}\label{sec:triton_roofline_results}
-Figure~\ref{fig:triton_roofline} places the measured kernels on the
-A100 roofline. Dense GEMM and Flash Attention sit near the compute
-ceiling; SWFA inherits the same placement (its scores are dense within
-the window); decode attention sits on the HBM ridge at about $1$\,
-FLOP/byte arithmetic intensity.
+Figure~\ref{fig:triton_roofline} places the measured kernels on
+the A100 roofline. The dense GEMM and Flash Attention land close
+to the compute ceiling; SWFA inherits the same placement, since
+its scores are dense inside the window; the decode attention
+kernel lives on the HBM ridge at about $1$\,FLOP/byte.
 
 \begin{figure}[H]
 \centering
@@ -220,9 +237,10 @@ FLOP/byte arithmetic intensity.
 \subsection{Auto-tune Configurations}\label{sec:triton_autotune}
 Table~\ref{tab:triton_autotune} reports the Triton-selected
 configurations for the dense GEMM at three shape classes. The
-auto-tuner chooses deeper pipelines for square GEMMs (three stages)
-and shallower ones for skinny GEMMs (two stages) because the
-$K$-dimension is too short to hide a third stage's prefetch.
+auto-tuner systematically picks a deeper pipeline for square
+GEMMs (three stages) and a shallower one for skinny GEMMs (two
+stages), because the $K$-dimension in a skinny GEMM is too short
+to hide the prefetch cost of a third stage.
 
 \begin{table}[h]
 \centering
@@ -241,20 +259,22 @@ $2048 \times 2048 \times 128$  & $(128, 64,32)$ & 4 & 2 & 124 \\
 
 \subsection{Cross-Validation
 Agreement}\label{sec:triton_agreement}
-On the dense GEMM, the three implementations agree to within
-$10^{-4}$ FP32 and the throughputs differ by $<\!3\%$. On Flash
-Attention, Triton and CUTLASS agree within the same tolerance; the
-Torch-inductor path uses a slightly different accumulation order and
-shows a $1.5 \times 10^{-4}$ peak difference that is still within
-the $10^{-3}$ correctness tolerance used for FP16 attention.
+On the dense GEMM the three implementations agree within
+$10^{-4}$ in FP32, and their throughputs are within $3\%$ of one
+another. On Flash Attention, Triton and CUTLASS agree within the
+same tolerance; the Torch-inductor path uses a slightly
+different accumulation order and therefore shows a peak
+difference of about $1.5 \times 10^{-4}$, still well inside the
+$10^{-3}$ correctness tolerance adopted here for FP16 attention.
 
 \section{Triton Implementation of
 SWFA}\label{sec:triton_swfa}
-A Triton implementation of the SWFA forward kernel was developed as a
-cross-validation artefact for the PyTorch reference implementation of
-Chapter~\ref{ch:swfa}. The block classification is executed on the
-host once per shape and passed to the kernel as an index array, so
-that the Triton kernel only has to iterate over non-skipped blocks:
+A Triton implementation of the SWFA forward kernel was built
+primarily as a cross-validation artefact for the PyTorch
+reference of Chapter~\ref{ch:swfa}. Block classification is run
+once per shape on the host and then passed to the kernel as an
+index array, so that the Triton kernel itself only has to iterate
+over the non-skipped blocks:
 
 \begin{lstlisting}[language=Python,basicstyle=\ttfamily\scriptsize]
 @triton.jit
@@ -269,52 +289,56 @@ def swfa_forward(Q, K, V, O,
     r, c = rc // 65536, rc %  65536  # pack/unpack
     # ... online softmax over the columns of block (r,c) ...
 \end{lstlisting}
-This kernel reaches $241$\,TFLOPS on the
-$(N{=}2048, w{=}512)$ configuration, which is $40\%$ higher than the
-Triton vanilla Flash Attention at the same sequence length and within
-$7\%$ of the hand-tuned CUTLASS version.
+This kernel attains $241$\,TFLOPS on the
+$(N = 2048,\, w = 512)$ configuration, which is $40\%$ higher
+than the Triton vanilla Flash Attention at the same sequence
+length and within $7\%$ of the hand-tuned CUTLASS version.
 
 \section{Discussion}\label{sec:triton_discussion}
 
 \subsection{Triton as a Complement to
 CUTLASS}\label{sec:triton_complement}
-The ecosystem positions Triton and CUTLASS as complements rather than
-competitors. Triton gets to a working kernel in hours, enables rapid
-ablation of tile shapes and fusion patterns, and compiles down to
-PTX that uses the same Tensor-Core instructions as CUTLASS. CUTLASS
+The GPU-kernel ecosystem is best understood as placing Triton and
+CUTLASS in complementary rather than competing positions. Triton
+reaches a working kernel within hours, supports rapid ablation of
+tile shapes and fusion patterns, and compiles down to PTX that
+issues the same Tensor-Core instructions as CUTLASS would. CUTLASS
 retains a $5$--$10\%$ absolute throughput advantage on the most
-performance-critical kernels (the Flash Attention family), which
-justifies the extra engineering investment for production kernels.
-In this thesis we use Triton for exploration and for writing the
-profiling pipeline, and CUTLASS for the final kernels that ship in the
-SGLang runtime.
+performance-critical kernels---the Flash Attention family being
+the canonical example---which makes the extra engineering
+investment worthwhile for production kernels. In this thesis we
+therefore use Triton during exploration and for the profiling
+pipeline, while CUTLASS carries the final kernels that ship in
+the SGLang runtime.
 
 \subsection{Auto-tune Caching
 Pitfalls}\label{sec:triton_cache_pitfalls}
-The shape-indexed auto-tune cache must include the data type in its
-key. We observed a $20\%$ throughput regression when an FP32 kernel
-accidentally hit an FP16-tuned entry because the cache was keyed on
-$(M, N, K)$ only. Including \texttt{dtype} and
-\texttt{accumulator\_dtype} in the cache key eliminates the problem.
+The shape-indexed auto-tune cache must include the data type as
+part of its key. In our own experience, a $20\%$ throughput
+regression showed up when an FP32 kernel accidentally hit an
+FP16-tuned cache entry because the key had only been
+$(M, N, K)$. Extending the key to include both \texttt{dtype} and
+\texttt{accumulator\_dtype} made the problem disappear.
 
 \subsection{Limitations}\label{sec:triton_limitations}
-The pipeline currently supports only A100 hardware; the H100 path is
-straightforward because Triton already emits WGMMA instructions, but
-the auto-tune search space needs widening to include the new
-$128 \times 256$ tile shapes and four-stage pipelines. Multi-vendor
-backends (Intel Xe, AMD CDNA) would require retargeting the roofline
-constants and the auto-tune space; the rest of the pipeline is
-framework-agnostic.
+At present the pipeline supports only A100 hardware. The path
+to H100 is conceptually simple---Triton already emits WGMMA
+instructions---but the auto-tune search space needs widening to
+cover the new $128 \times 256$ tile shapes and the four-stage
+pipeline depth available on Hopper. Multi-vendor back-ends
+(Intel Xe, AMD CDNA) would further require retargeting the
+roofline constants and the auto-tune space; the remainder of the
+pipeline is framework-agnostic.
 
 \section{Summary}\label{sec:triton_summary}
-Triton provides a productive layer for kernel-level experimentation
-that complements the template-driven CUTLASS work of
-Chapter~\ref{ch:cutlass}. The profiling pipeline introduced here gives
-a uniform lens through which the GEMM, attention, and decode kernels
-developed earlier in the thesis can be compared and auto-tuned,
-closing the loop between algorithmic design and measured on-GPU
-performance. The Triton SWFA implementation of
-Section~\ref{sec:triton_swfa} reaches $94\%$ of the CUTLASS SWFA
-throughput on the $(N{=}2048, w{=}512)$ configuration, which is a
-strong independent confirmation of the numbers reported in
-Chapter~\ref{ch:swfa}.
+Triton supplies a productive environment for kernel-level
+experimentation that complements the template-driven CUTLASS
+work of Chapter~\ref{ch:cutlass}. The profiling pipeline
+introduced here provides a uniform lens through which the GEMM,
+attention, and decode kernels of the preceding chapters can be
+compared and auto-tuned, thereby closing the loop between
+algorithmic design and measured on-GPU performance. The Triton
+SWFA implementation of Section~\ref{sec:triton_swfa} reaches
+$94\%$ of the CUTLASS SWFA throughput at $N = 2048$ and
+$w = 512$---a strong independent confirmation of the numbers
+reported in Chapter~\ref{ch:swfa}.

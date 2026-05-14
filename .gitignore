@@ -28,6 +28,9 @@ Thumbs.db
 # Backup zip (template snapshot — don't commit)
 IISTThesis-master-original.zip
 
+# Local pre-rewrite snapshot — don't commit
+backup_pre_plagiarism_rewrite/
+
 # Defense slides — intermediate image cache
 _pptx_tmp/
 

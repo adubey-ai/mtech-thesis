@@ -1,13 +1,14 @@
 \chapter{Mathematical Proofs}
 \label{chp:appB}
 
-This appendix collects the full proofs of the theoretical results
-stated in the main text. The proofs are self-contained: each
-reproduces the claim before giving the argument, and each is
-numbered so that it can be cited from any chapter.
+This appendix collects, in one place, the full proofs of the
+theoretical results stated in the main text. The proofs are
+self-contained---each one restates the claim before the
+argument, and each is numbered so that any chapter can cite it
+without ambiguity.
 
 \section{Notation and Conventions}\label{app:notation}
-Throughout this appendix we use the following conventions.
+The following conventions are used throughout this appendix.
 \begin{itemize}
     \item $N$ denotes the sequence length; $d$ the per-head embedding
           dimension; $H$ the number of heads; $B$ the batch size.
@@ -39,28 +40,28 @@ Then:
 \end{lemma}
 
 \begin{proof}
-Consider the scalar function $\phi(i, j) = j - i$ on $B$. Because
-$\phi$ is linear and $B$ is a rectangle aligned with the coordinate
-axes, $\phi$ attains its minimum at the corner $(r_1, c_0)$ (largest
-$i$, smallest $j$) and its maximum at $(r_0, c_1)$ (smallest $i$,
-largest $j$).
+Define the scalar function $\phi(i, j) = j - i$ on the block
+$B$. Since $\phi$ is linear and $B$ is an axis-aligned
+rectangle, $\phi$ attains its minimum at the corner $(r_1, c_0)$
+(the corner with the largest $i$ and the smallest $j$) and its
+maximum at $(r_0, c_1)$ (smallest $i$, largest $j$).
 
-\textbf{(i) Outside case.} $B \cap W = \emptyset$ iff $\phi$ never
-lies in $[-w_l, w_r]$ on $B$, which is equivalent to
-$\max_B \phi < -w_l$ \emph{or} $\min_B \phi > w_r$. Substituting the
-extrema,
-$\max_B \phi = c_1 - r_0$ and $\min_B \phi = c_0 - r_1$, we get
-$c_1 - r_0 < -w_l$ or $c_0 - r_1 > w_r$, i.e.\ $c_1 < r_0 - w_l$ or
-$c_0 > r_1 + w_r$.
+\textbf{(i) Outside case.} $B \cap W = \emptyset$ holds iff
+$\phi$ never lands in $[-w_l, w_r]$ on $B$, which is equivalent
+to requiring $\max_B \phi < -w_l$ \emph{or} $\min_B \phi > w_r$.
+Plugging in $\max_B \phi = c_1 - r_0$ and
+$\min_B \phi = c_0 - r_1$ gives
+$c_1 - r_0 < -w_l$ or $c_0 - r_1 > w_r$, i.e.\
+$c_1 < r_0 - w_l$ or $c_0 > r_1 + w_r$.
 
-\textbf{(ii) Inside case.} $B \subseteq W$ iff $\phi(B) \subseteq
-[-w_l, w_r]$, which requires $\max_B \phi \le w_r$ and
-$\min_B \phi \ge -w_l$. Substituting,
-$c_1 - r_0 \le w_r$ and $c_0 - r_1 \ge -w_l$, i.e.\
-$c_1 \le r_0 + w_r$ and $c_0 \ge r_1 - w_l$.
+\textbf{(ii) Inside case.} $B \subseteq W$ holds iff
+$\phi(B) \subseteq [-w_l, w_r]$, that is,
+$\max_B \phi \le w_r$ and $\min_B \phi \ge -w_l$. Substituting
+the same extrema yields $c_1 - r_0 \le w_r$ and
+$c_0 - r_1 \ge -w_l$, which are precisely the stated inequalities.
 
-The clipping of $W$ to $[0, N-1]^2$ does not change either inequality,
-because $B$ itself is a subset of $[0, N-1]^2$ by construction.
+Clipping $W$ to $[0, N-1]^2$ does not affect either inequality,
+because $B$ is itself a subset of $[0, N-1]^2$ by construction.
 \end{proof}
 
 \begin{corollary}\label{cor:classifier_cost}
@@ -70,15 +71,17 @@ of the sets $\mathcal{I}, \mathcal{X}, \mathcal{O}$.
 \end{corollary}
 
 \begin{proof}
-For each of the $T_r T_c$ blocks, Algorithm~\ref{alg:swfa_classify}
-performs a constant number of comparisons derived from the two
-predicates of Lemma~\ref{lem:corner2}. The three sets are disjoint by
-construction: the \texttt{outside} predicate takes precedence; the
-\texttt{inside} predicate is only tested when \texttt{outside} is
-false; and the remaining blocks are placed in $\mathcal{X}$. By
-Lemma~\ref{lem:corner2}, a block is outside iff \texttt{outside} is
-true, and inside iff \texttt{inside} is true; the three sets are
-therefore a partition of the grid.
+For each of the $T_r T_c$ blocks,
+Algorithm~\ref{alg:swfa_classify} performs a constant number of
+comparisons derived from the two predicates of
+Lemma~\ref{lem:corner2}. Disjointness of the three sets is
+enforced by the order of the tests: the \texttt{outside}
+predicate takes precedence; the \texttt{inside} predicate is
+tested only when \texttt{outside} is false; any remaining block
+is assigned to $\mathcal{X}$. By Lemma~\ref{lem:corner2}, a
+block is outside exactly when \texttt{outside} is true and
+inside exactly when \texttt{inside} is true. The three sets
+therefore form a partition of the grid.
 \end{proof}
 
 \section{Block-Count Lemma}\label{app:proofs_block}
@@ -97,22 +100,25 @@ $N \to \infty$ with fixed $W$.
 \end{lemma}
 
 \begin{proof}
-With $B \mid N$, the grid has $T = N/B$ blocks per axis. By
-Lemma~\ref{lem:corner2}(i), block $(r,c)$ is outside iff
-$c B + B - 1 < r B - W$ or $c B > r B + B - 1 + W$, i.e.\
+Under the assumption $B \mid N$, the grid contains $T = N/B$
+blocks along each axis. Lemma~\ref{lem:corner2}(i) then says that
+block $(r, c)$ is outside iff
+$c B + B - 1 < r B - W$ or $c B > r B + B - 1 + W$, which
+simplifies to
 \begin{equation}\label{eq:blockout}
     c \le r - \left\lceil (W + B - 1)/B \right\rceil
     \quad \text{or} \quad
     c \ge r + \left\lceil (W + B - 1)/B \right\rceil.
 \end{equation}
-Let $k^\star = \lceil (W + B - 1)/B \rceil$. The number of outside
-blocks in row $r$ is therefore $\max(0, r - k^\star) +
-\max(0, T - 1 - r - k^\star)$, and summing over $r$ yields
-$|\mathcal{O}| = 2 \sum_{r=0}^{T-1} \max(0, r - k^\star)$ after
-collecting symmetric terms, which simplifies to
+Writing $k^\star = \lceil (W + B - 1)/B \rceil$, the number of
+outside blocks in row $r$ becomes
+$\max(0, r - k^\star) + \max(0, T - 1 - r - k^\star)$. Summing
+over $r$ and collecting the symmetric terms gives
+$|\mathcal{O}| = 2 \sum_{r=0}^{T-1} \max(0, r - k^\star)$, which
+evaluates to
 $T^2 - (2 k^\star - 1) T + k^\star(k^\star - 1)$.
-Dividing by $T^2$ and letting $N \to \infty$ with $W$ fixed,
-$k^\star / T \to W/N$, and the skip ratio converges to
+Dividing through by $T^2$ and taking $N \to \infty$ at fixed $W$
+gives $k^\star / T \to W / N$, so the skip ratio converges to
 $1 - 2W/N$, as claimed.
 \end{proof}
 
@@ -129,7 +135,7 @@ is strictly convex for $w > 0$.
 \end{theorem}
 
 \begin{proof}
-Differentiating twice,
+Differentiating $\mathcal{L}$ twice yields
 \begin{equation}
     \mathcal{L}'(w) = \alpha \kappa N d
       - \frac{\gamma N A_0 \lambda}{1 - e^{-\lambda}}
@@ -140,20 +146,23 @@ Differentiating twice,
       = \frac{\gamma N A_0 \lambda^2}{2(1 - e^{-\lambda})}
         e^{-\lambda w / 2}.
 \end{equation}
-All prefactors are positive: $\gamma > 0$ by assumption, $N, A_0,
-\lambda > 0$ by model specification, and $1 - e^{-\lambda} > 0$
-because $\lambda > 0$. The exponential $e^{-\lambda w / 2} > 0$ for
-all $w \in \mathbb{R}$. Hence $\mathcal{L}''(w) > 0$ for all $w > 0$,
-and $\mathcal{L}$ is strictly convex.
+Every prefactor is positive: $\gamma > 0$ is assumed,
+$N$, $A_0$, and $\lambda$ are positive by the model
+specification, and $1 - e^{-\lambda} > 0$ whenever $\lambda > 0$.
+The exponential $e^{-\lambda w / 2}$ is strictly positive for
+every $w \in \mathbb{R}$. Hence $\mathcal{L}''(w) > 0$ for all
+$w > 0$, which means $\mathcal{L}$ is strictly convex on that
+domain.
 \end{proof}
 
 \begin{remark}
-Because $\mathcal{L}''$ is a positive exponential times a constant, the
-convexity is \emph{strong}: for any $w_0 > 0$ there exists $\mu > 0$
-such that $\mathcal{L}''(w) \ge \mu$ on any bounded interval
-containing $w_0$. This gives a linear convergence rate for gradient
-descent on $\mathcal{L}$ and justifies a Newton step for the
-$w^\star$ derivation below.
+$\mathcal{L}''$ is a positive exponential multiplied by a
+constant, so the convexity is in fact \emph{strong}: for any
+$w_0 > 0$ there exists $\mu > 0$ such that
+$\mathcal{L}''(w) \ge \mu$ on any bounded interval containing
+$w_0$. This guarantees a linear rate of convergence for gradient
+descent on $\mathcal{L}$ and legitimises the Newton step used in
+the derivation of $w^\star$ below.
 \end{remark}
 
 \section{Closed-Form Optimal Window}\label{app:proof_optw}
@@ -173,31 +182,34 @@ equals $1$).
 \end{theorem}
 
 \begin{proof}
-By Theorem~\ref{thm:convex2}, $\mathcal{L}$ is strictly convex on
-$w > 0$, so its minimiser is the unique stationary point.
-$\mathcal{L}'(w) = 0$ iff
+By Theorem~\ref{thm:convex2} the loss $\mathcal{L}$ is strictly
+convex on the domain $w > 0$, so its minimiser coincides with
+its unique stationary point. Setting $\mathcal{L}'(w) = 0$ gives
 \begin{equation}
     \alpha \kappa N d
     = \frac{\gamma N A_0 \lambda}{1 - e^{-\lambda}}
       e^{-\lambda w / 2},
 \end{equation}
-i.e.\
+and therefore
 \begin{equation}
     e^{-\lambda w / 2}
     = \frac{\alpha \kappa d (1 - e^{-\lambda})}{\gamma A_0 \lambda}.
 \end{equation}
-Taking $\ln$ of both sides and multiplying by $-2/\lambda$
-gives~\eqref{eq:opt_w_app}. The argument of the outer logarithm is
-positive, so $w^\star \in \mathbb{R}$; it is positive exactly when the
-argument exceeds one, which is the regime in which local attention
-actually helps (otherwise dense attention is cheaper than the loss in
-accuracy and $w = N - 1$ is optimal).
+Applying $\ln$ to both sides and multiplying by $-2/\lambda$
+recovers~\eqref{eq:opt_w_app}. The argument of the outer
+logarithm is positive, so $w^\star$ is real; it is strictly
+positive exactly when that argument exceeds one, which is the
+regime in which the local window actually improves on dense
+attention (outside that regime, dense attention is cheaper than
+the accuracy loss implied by a shorter window, and $w = N - 1$
+is optimal).
 
-Projection onto $[1, N-1]$ preserves uniqueness: on the left, the
-convexity implies $\mathcal{L}(1) \le \mathcal{L}(0)$, and on the right
-$\mathcal{L}(N-1)$ is dominated by the computation term because the
-exponential has decayed. Hence the projected minimiser is obtained by
-clipping $w^\star$ to $[1, N-1]$.
+Projection onto $[1, N-1]$ preserves uniqueness. At the left
+endpoint, convexity gives $\mathcal{L}(1) \le \mathcal{L}(0)$;
+at the right endpoint, $\mathcal{L}(N-1)$ is dominated by the
+computation term because the exponential has already decayed.
+The projected minimiser is thus obtained by clipping $w^\star$
+to $[1, N-1]$.
 \end{proof}
 
 \begin{corollary}[Sensitivities]\label{cor:sens}
@@ -226,9 +238,10 @@ $2/\lambda$ diverges, so $w^\star \to \infty$.
 \section{Flash Attention Softmax
 Correctness}\label{app:proof_flash_softmax}
 
-The online softmax update used by both Flash Attention and SWFA is
-algebraically equivalent to the full-batch softmax. The proof is a
-straightforward induction, reproduced for completeness.
+Flash Attention and SWFA both rely on an online form of the
+softmax update, and that update is algebraically equivalent to
+the full-batch softmax. The argument is a short induction and is
+reproduced below for completeness.
 
 \begin{lemma}[Online softmax equivalence]\label{lem:online_softmax}
 Given scalars $s_1, \dots, s_N$ and values $v_1, \dots, v_N$, let
@@ -249,22 +262,23 @@ $(m^{(T)}, \ell^{(T)}, o^{(T)}) = (m, \ell, o)$.
 \end{lemma}
 
 \begin{proof}
-By induction on $t$. Denote by $I_t = \bigcup_{s \le t} B_s$ the set
-of indices processed up to step $t$, and define
+We argue by induction on $t$. Let $I_t = \bigcup_{s \le t} B_s$
+denote the set of indices processed by step $t$, and define
 $m_t = \max_{i \in I_t} s_i$,
-$\ell_t = \sum_{i \in I_t} e^{s_i - m_t}$,
+$\ell_t = \sum_{i \in I_t} e^{s_i - m_t}$, and
 $o_t = \sum_{i \in I_t} e^{s_i - m_t} v_i / \ell_t$.
 
-\emph{Base case.} $t = 0$: $I_0 = \emptyset$, all three quantities
-coincide with the initialisation.
+\emph{Base case.} At $t = 0$, $I_0 = \emptyset$, and all three
+quantities agree with the initialisation.
 
-\emph{Inductive step.} Assume the claim holds for $t-1$. At step $t$,
-$m^{(t)} = \max(m^{(t-1)}, \max_{i \in B_t} s_i) = m_t$ by definition.
-Multiplying the previous sum by $e^{m^{(t-1)} - m^{(t)}}$ rescales the
-exponents to the new reference $m^{(t)}$, and adding the contribution
-from $B_t$ produces exactly
-$\ell_t = \sum_{i \in I_t} e^{s_i - m^{(t)}}$, matching the claim. The
-same rescaling applied to the numerator of $o$ gives $o_t$.
+\emph{Inductive step.} Suppose the claim holds at step $t-1$. At
+step $t$, $m^{(t)} = \max(m^{(t-1)}, \max_{i \in B_t} s_i) = m_t$
+by definition. Multiplying the previous partial sum by
+$e^{m^{(t-1)} - m^{(t)}}$ rescales its exponents to the new
+reference $m^{(t)}$, and adding the contribution of $B_t$ yields
+exactly $\ell_t = \sum_{i \in I_t} e^{s_i - m^{(t)}}$---the
+claim. Applying the same rescaling to the numerator of $o$
+reproduces $o_t$.
 \end{proof}
 
 \begin{corollary}[SWFA equivalence]
@@ -273,17 +287,19 @@ to floating-point round-off.
 \end{corollary}
 
 \begin{proof}
-SWFA skips exactly the blocks that are outside the window (by
-Lemma~\ref{lem:corner2}(i)), and on the remaining blocks it applies
-either no mask (inside) or the additive $\{0, -\infty\}$ mask of
-Algorithm~\ref{alg:swfa_mask} (intersecting). Because masked entries
-contribute zero to both the numerator and the denominator of the
-softmax, the online update of Lemma~\ref{lem:online_softmax} acting
-on masked scores is equivalent to the online update acting on the
-full set of in-window scores. Hence SWFA's output equals the
-vanilla sliding-window attention's output up to the rearrangement of
-the summation order, and floating-point associativity accounts for
-any observed differences.
+Lemma~\ref{lem:corner2}(i) guarantees that SWFA skips precisely
+those blocks that lie outside the window. On the blocks that
+remain, SWFA either applies no mask (inside blocks) or applies
+the additive $\{0, -\infty\}$ mask of
+Algorithm~\ref{alg:swfa_mask} (intersecting blocks). Masked
+entries contribute zero to both the numerator and the
+denominator of the softmax, so the online update of
+Lemma~\ref{lem:online_softmax}, applied to the masked scores,
+is equivalent to the same update applied to the full collection
+of in-window scores. SWFA therefore produces the same output as
+vanilla sliding-window attention, up to the rearrangement of the
+summation order; any observed numerical differences are
+accounted for by floating-point associativity alone.
 \end{proof}
 
 \section{Communication-Cost Bounds for
@@ -301,18 +317,20 @@ reflects the two phases (reduce-scatter + all-gather).
 \end{lemma}
 
 \begin{proof}
-A ring all-reduce proceeds in two phases of $P - 1$ steps each. Each
-step sends a fragment of size $M s / P$ to the next worker. The
-latency term is therefore $2 (P - 1) \alpha$, and the bandwidth term
-is $2 (P - 1) (M s / P) / B = 2 (P - 1) M s / (P B)$.
-Summing gives~\eqref{eq:ring_cost}.
+A ring all-reduce runs in two phases of $P - 1$ steps each, and
+every step forwards a fragment of size $M s / P$ to the next
+worker. The latency contribution is therefore $2 (P - 1) \alpha$
+and the bandwidth contribution is
+$2 (P - 1) (M s / P) / B = 2 (P - 1) M s / (P B)$. Adding the
+two gives~\eqref{eq:ring_cost}.
 \end{proof}
 
 \begin{corollary}\label{cor:ddp_limit}
-As $P \to \infty$ with $M$ fixed, $T_{\text{ring}}(M, P) \to 2 M s / B
-+ 2 (P - 1) \alpha$, so the per-worker bandwidth term is asymptotically
-independent of $P$ and the scalability is limited only by the
-latency constant.
+Letting $P \to \infty$ with $M$ held fixed,
+$T_{\text{ring}}(M, P) \to 2 M s / B + 2 (P - 1) \alpha$. The
+per-worker bandwidth cost is asymptotically independent of $P$,
+so the scalability is ultimately limited only by the latency
+constant.
 \end{corollary}
 
 \begin{lemma}[ZeRO-3 communication volume]\label{lem:zero3_bw}
@@ -327,27 +345,30 @@ for gradients).
 \end{lemma}
 
 \begin{proof}
-Each parameter is sharded across $P$ workers. Before the forward
-pass, each worker must receive the other workers' shards via an
-all-gather, contributing $(P-1)/P \cdot M s$ per worker-input. By
-symmetry the reverse all-gather before the backward pass adds a second
-$(P-1)/P \cdot M s$; the reduce-scatter of the gradients is the
-symmetric operation and contributes $(P-1)/P \cdot M s_{\text{grad}}$.
-Summing gives the stated total.
+Every parameter is sharded across $P$ workers. Before the
+forward pass, each worker must receive the other workers' shards
+via an all-gather, which contributes $(P-1)/P \cdot M s$ per
+worker to the communication budget. By symmetry, the analogous
+all-gather issued before the backward pass contributes another
+$(P-1)/P \cdot M s$. The reduce-scatter over gradients is the
+dual operation and contributes
+$(P-1)/P \cdot M s_{\text{grad}}$. Adding the three terms yields
+the total claimed in the lemma.
 \end{proof}
 
 \begin{remark}
-Comparing Lemma~\ref{lem:zero3_bw} with Lemma~\ref{lem:ddp_bw}, ZeRO-3
-sends roughly $1.5\times$ the data of DDP per step. The overhead is
-amortised by the $8\times$ reduction in memory, which allows a
-correspondingly larger batch size and therefore fewer steps per
-epoch.
+Comparing Lemma~\ref{lem:zero3_bw} against Lemma~\ref{lem:ddp_bw},
+ZeRO-3 sends about $1.5\times$ as much data per step as DDP.
+That overhead is paid off by the $8\times$ drop in memory, which
+in turn permits a correspondingly larger batch size and therefore
+fewer steps per epoch.
 \end{remark}
 
 \section{Exponential Decay Assumption}\label{app:proof_decay}
 
-The attention-decay assumption $A_{ij} = A_0 e^{-\lambda |i - j|}$ is
-a modelling choice. We justify it from two directions.
+The assumption that attention weights decay as
+$A_{ij} = A_0 e^{-\lambda |i - j|}$ is a modelling choice. It can
+be justified from two directions, which we take up in turn.
 
 \begin{proposition}[Empirical decay]\label{prop:decay}
 For a transformer with softmax attention and inputs drawn from a
@@ -359,21 +380,23 @@ $C > 0$.
 \end{proposition}
 
 \begin{proof}[Proof sketch]
-By the data processing inequality for the Markov chain, the mutual
-information $I(x_i; x_j)$ decays exponentially in $|i-j|$ with rate
-$1/\tau$. Because softmax attention can be viewed as a non-parametric
-estimator of $I(x_i; x_j)$ up to a constant, its expectation also
-decays at rate $1/\tau$. Setting $\lambda = 1/\tau$ yields the
-claim; a rigorous statement requires Dobrushin-style contraction
-inequalities, which we omit.
+The data-processing inequality applied to the Markov chain
+implies that the mutual information $I(x_i; x_j)$ decays
+exponentially in $|i - j|$ with rate $1/\tau$. Because softmax
+attention can be viewed, up to a constant, as a non-parametric
+estimator of $I(x_i; x_j)$, its expectation decays at the same
+rate. Setting $\lambda = 1/\tau$ produces the stated bound; a
+fully rigorous statement would require Dobrushin-style
+contraction inequalities, which we do not pursue here.
 \end{proof}
 
 \begin{remark}
 The closed-form optimal-window formula
-\eqref{eq:opt_w_app} is robust to misspecification of $\lambda$: the
-logarithm dampens parameter misestimation, so halving or doubling
-$\lambda$ changes $w^\star$ by at most $\ln 2 \cdot 2/\lambda$, which
-is typically $<\!20\%$ of the value itself.
+\eqref{eq:opt_w_app} is comparatively robust to misspecification
+of $\lambda$. The logarithm flattens parameter errors, so
+halving or doubling $\lambda$ shifts $w^\star$ by at most
+$\ln 2 \cdot 2/\lambda$---typically less than $20\%$ of the
+value itself.
 \end{remark}
 
 \section{Reproducibility of the Numerical
@@ -391,18 +414,22 @@ The SWFA output $\hat O$ satisfies
 \end{proposition}
 
 \begin{proof}[Proof sketch]
-Each entry of $S_{rc} = Q_r K_c^\top / \sqrt{d}$ is the inner product
-of two $d$-vectors and incurs relative error at most $d u$. The
-online softmax adds at most two multiplications and one subtraction,
-contributing $3 u$ per block pass; with $T_c$ column blocks and
-sub-additive rounding, the total is $3 d + 2 T_c u \le 3 d + 2 N/B_c
-u$. Multiplying by $V$ introduces another $d$-vector inner product,
-bounded by $\|V\|_\infty$. Combining the bounds gives the claim up to
-$\mathcal{O}(u^2)$ terms.
+Every entry of $S_{rc} = Q_r K_c^\top / \sqrt{d}$ is the inner
+product of two $d$-vectors and therefore carries a relative
+error bounded by $d u$. The online softmax introduces at most
+two multiplications and one subtraction per block, adding $3u$
+per block pass; summed over $T_c$ column blocks, and using
+sub-additivity of rounding, the total is
+$3d + 2 T_c u \le 3d + 2 N/B_c u$. The final multiplication by
+$V$ is another $d$-vector inner product and is bounded in terms
+of $\|V\|_\infty$. Collecting these contributions produces the
+stated bound up to $\mathcal{O}(u^2)$ terms.
 \end{proof}
 
-Proposition~\ref{prop:fp32_err} predicts a worst-case FP32 error of
-$\sim 4 \times 10^{-5}$ at $N = 128$, $d = 16$, which comfortably
-bounds the measured $\sim 8 \times 10^{-7}$ in
-Table~\ref{tab:swfa_accuracy}. The gap is explained by the typical
-random-input pessimism of the analysis.
+For $N = 128$ and $d = 16$,
+Proposition~\ref{prop:fp32_err} predicts a worst-case FP32 error
+of roughly $4 \times 10^{-5}$, which comfortably dominates the
+$\sim 8 \times 10^{-7}$ actually observed in
+Table~\ref{tab:swfa_accuracy}. The gap is the usual one: the
+bound assumes worst-case random inputs, which pessimistically
+overestimates the error on the tame inputs used in practice.

@@ -1,62 +1,67 @@
 \chapter{Distributed Computing and Training}\label{ch:distributed}
 
-\emph{Placement in the stack (Fig.~\ref{fig:intro_stack}).} This
-chapter occupies the top layer of the proposed stack. Every decision
-below it---the tile shapes of the GEMM kernels of
-Chapter~\ref{ch:cutlass}, the block sizes of the SWFA kernel of
-Chapter~\ref{ch:swfa}, and the page size of the SGLang KV cache of
-Chapter~\ref{ch:sglang}---is constrained by the per-GPU memory budget
-that the distributed schedule leaves behind. The literature-review
-gap identified in Section~\ref{sec:lit_shard} is addressed here: we
-present a \emph{controlled} single-node comparison of DP, DDP, FSDP,
-and DeepSpeed ZeRO-3 that varies only the parallelisation strategy
-while keeping the model, dataset, random seed, and hardware fixed.
-The resulting memory budget and GPU-utilisation numbers are the
-reference points used by every subsequent chapter.
+\emph{Placement in the stack (Fig.~\ref{fig:intro_stack}).} The
+present chapter sits at the top of the proposed stack, and every
+decision made in the chapters below it is bound by the memory
+budget that the distributed schedule leaves behind on each GPU:
+the GEMM tile shapes of Chapter~\ref{ch:cutlass}, the SWFA block
+sizes of Chapter~\ref{ch:swfa}, and the KV-cache page size of
+the SGLang runtime in Chapter~\ref{ch:sglang} all inherit that
+constraint. The open gap identified in the literature review
+(Section~\ref{sec:lit_shard}) is closed here by running a
+\emph{controlled} single-node comparison among DP, DDP, FSDP, and
+DeepSpeed ZeRO-3, in which only the parallelisation strategy is
+varied while the model, the dataset, the random seed, and the
+hardware are held fixed. The per-GPU memory budget and
+GPU-utilisation numbers that fall out of this study are the
+reference points used throughout the chapters that follow.
 
 \section{Background}\label{sec:dist_bg}
 
 \subsection{Formal Setting}\label{sec:dist_formal}
-Let $\theta \in \mathbb{R}^M$ be the full parameter vector of a model,
-$f_\theta$ the loss computed on a mini-batch $\mathcal{B}$ of size $B$,
-and $P$ the number of workers. A generic distributed training step
-computes
+Write $\theta \in \mathbb{R}^M$ for the full parameter vector of
+the model, $f_\theta$ for the loss on a mini-batch $\mathcal{B}$ of
+size $B$, and $P$ for the number of workers. A generic distributed
+training step then reduces to
 \begin{equation}\label{eq:dist_step}
     g \;=\; \frac{1}{P} \sum_{p=1}^{P}
             \nabla_\theta f_\theta(\mathcal{B}_p),
     \qquad
     \theta \leftarrow \theta - \eta \,g,
 \end{equation}
-where $\mathcal{B}_p \subset \mathcal{B}$ is the slice consumed by
-worker $p$. The four strategies compared in this chapter differ
-exclusively in (i)~which parts of $\theta$, $g$, and the optimiser state
-each worker stores and (ii)~which collective operations are used to
-keep~\eqref{eq:dist_step} mathematically equivalent to a single-device
-computation.
+where $\mathcal{B}_p \subset \mathcal{B}$ is the slice that
+worker~$p$ consumes. What distinguishes the four strategies
+compared in this chapter is only two things: (i)~which portions of
+$\theta$, $g$, and the optimiser state each worker chooses to
+store, and (ii)~which collective operations are used to keep
+equation~\eqref{eq:dist_step} numerically equivalent to the single
+device computation.
 
 \subsection{Data Parallelism}\label{sec:dp_bg}
-Data parallelism is the oldest form of distributed training. Each
-worker keeps a full replica of the model, consumes a disjoint shard of
-the data batch, computes gradients locally, and participates in an
-all-reduce so that all replicas see the same synchronised gradient
-before the optimiser step. Standard data parallelism (often referred to
-as simply \emph{DP}) is easy to implement but suffers from
-communication bottlenecks and memory inefficiency because every replica
-stores the whole model.
+Of all distributed-training schemes, data parallelism is the
+oldest. Every worker hosts a full replica of the model, takes a
+disjoint slice of the data batch, computes its gradients on that
+slice locally, and then enters an all-reduce so that every replica
+observes the same synchronised gradient before the optimiser step
+fires. The plain form of data parallelism---often just called
+\emph{DP}---is easy to implement but suffers on two fronts: the
+communication cost of sending a full gradient every step, and the
+memory cost of storing the whole model on every worker.
 
-The PyTorch DDP path~\cite{li2020pytorch} addresses DP's two weaknesses
-simultaneously. It groups gradients into fixed-size \emph{buckets} and
-issues an all-reduce per bucket, so that bucket $k$ can reduce while
-the backward pass is still producing bucket $k+1$; and it dispatches
-those reductions on a ring topology whose per-step bandwidth is
+PyTorch's DDP path~\cite{li2020pytorch} attacks both weaknesses at
+once. Gradients are collected into fixed-size \emph{buckets}, each
+bucket issues its own all-reduce, and bucket~$k$ can therefore
+begin its reduction while bucket~$k+1$ is still being produced by
+the backward pass. The reductions ride on a ring topology whose
+per-step bandwidth is
 \begin{equation}
     V_{\text{DDP}} \;=\; \frac{2(P-1)}{P} \cdot M \cdot s_{\text{grad}} ,
 \end{equation}
-where $s_{\text{grad}}$ is the gradient element size. The leading
-factor $2(P-1)/P$ approaches $2$ for any non-trivial $P$, so the
-per-worker wire traffic is independent of the world size---which is
-the scalability property that makes a ring all-reduce the preferred
-collective at the cluster scale.
+with $s_{\text{grad}}$ the size of a gradient element. Because the
+leading factor $2(P-1)/P$ converges to $2$ for any non-trivial $P$,
+the per-worker wire traffic is essentially independent of the world
+size---and it is precisely that scaling property that has made ring
+all-reduce the preferred collective at cluster scale.
 
 \begin{figure}[H]
     \centering
@@ -103,58 +108,65 @@ collective at the cluster scale.
 \end{figure}
 
 \subsection{Model Parallelism and Sharding}\label{sec:mp_bg}
-As models outgrow a single GPU, \emph{model parallelism} becomes
-necessary. Two classical variants are:
+Once the model has outgrown a single accelerator, some form of
+\emph{model parallelism} becomes unavoidable. Two classical variants
+dominate the literature:
 \begin{itemize}
-    \item \textbf{Pipeline parallelism}: sequential stages of the model
-          reside on different devices; pipeline bubbles and
-          load-balancing remain non-trivial. GPipe~\cite{huang2019gpipe}
-          amortises the bubble by processing $m$ micro-batches
-          concurrently and reduces the bubble fraction to
+    \item \textbf{Pipeline parallelism}: successive stages of the
+          model live on different devices. Pipeline bubbles and
+          load balancing between stages remain non-trivial.
+          GPipe~\cite{huang2019gpipe} amortises the bubble by
+          running $m$ micro-batches concurrently through the
+          pipeline and brings the bubble fraction down to
           $(P-1)/(m+P-1)$.
-    \item \textbf{Tensor parallelism}: individual layers are partitioned
+    \item \textbf{Tensor parallelism}: individual layers are split
           across devices, as popularised by
-          Megatron-LM~\cite{shoeybi2019megatron}. Tensor parallelism
-          inserts one all-reduce per forward pass and one per backward
-          pass for each partitioned layer, and works best within a
-          single NVLink domain.
+          Megatron-LM~\cite{shoeybi2019megatron}. Each partitioned
+          layer inserts one all-reduce into the forward pass and a
+          second into the backward pass, and the approach works
+          best inside a single NVLink domain.
 \end{itemize}
-A more recent alternative, \emph{Fully Sharded Data Parallel}
-(FSDP)~\cite{zhao2023pytorch}, combines data parallelism with parameter
-sharding: parameters, gradients, and optimiser states are sharded
-across all devices; parameters are all-gathered just-in-time for each
-layer and re-sharded immediately afterwards.
+A more recent approach, \emph{Fully Sharded Data Parallel}
+(FSDP)~\cite{zhao2023pytorch}, fuses data parallelism with
+parameter sharding. Parameters, gradients, and optimiser states
+are distributed across every device in the group; for each layer
+the parameters are all-gathered just in time, used for the forward
+or backward pass, and then immediately re-sharded.
 
 \subsection{ZeRO and DeepSpeed}\label{sec:zero_bg}
 ZeRO~\cite{rajbhandari2019zero,rajbhandari2021zero} generalises the
-data-parallel template by asking: for each component of the training
-state, which workers actually need a copy of it, and when? Stage one
-answers this for the Adam moments (they are only needed during the
-optimiser step, so one shard per worker is enough and a
-reduce-scatter produces it in place). Stage two extends the same
-argument to the gradients, eliminating the full gradient tensor from
-every worker's memory. Stage three extends it to the parameters
-themselves, which now live sharded and are gathered on the fly
-whenever a layer is about to execute. The per-worker memory at
-stage three scales as $M/P$, matching the lower bound that DP
-cannot approach; the price is two additional collective phases per
-layer, which the overlap scheduling discussed in
-Section~\ref{sec:res_overlap} must hide.
-DeepSpeed~\cite{rasley2020deepspeed} is a production implementation of
-ZeRO, with gradient compression, dynamic loss scaling, CPU offloading,
+data-parallel template by asking a single question for each piece
+of the training state: which workers really need to keep a copy of
+it, and at which point during the step? The answer for the Adam
+moments is given by stage one: the moments are only consulted
+during the optimiser step, so one shard per worker is enough, and a
+reduce-scatter produces that shard in place. Stage two extends the
+argument to the gradients, eliminating the full gradient tensor
+from every worker's memory. Stage three pushes it all the way to
+the parameters themselves: the parameters now live sharded, and
+each layer gathers the missing slices on demand just before it
+executes. At stage three the per-worker memory scales as $M/P$,
+which is the lower bound that plain DP never approaches; the price
+paid is two extra collective phases per layer, and those phases
+have to be hidden by the overlap scheduling discussed in
+Section~\ref{sec:res_overlap} or the throughput regresses.
+The production implementation of ZeRO is
+DeepSpeed~\cite{rasley2020deepspeed}, which wraps the core idea
+together with gradient compression, dynamic loss scaling, CPU and
 NVMe offloading, and Mixture-of-Experts
-support~\cite{rajbhandari2022deepspeed}. ZeRO-3 issues two additional
-collectives per layer compared to DDP (an all-gather before the
-forward/backward pass and a reduce-scatter after the backward pass),
-which must be overlapped carefully with compute to avoid a throughput
-regression.
+support~\cite{rajbhandari2022deepspeed}. Concretely, ZeRO-3 issues
+two collectives per layer over and above DDP---an all-gather before
+the forward or backward pass and a reduce-scatter after the
+backward pass---and each of them has to be overlapped carefully
+with compute if a throughput regression is to be avoided.
 
 \subsection{Communication-Cost Summary}\label{sec:dist_comms_summary}
-Table~\ref{tab:dist_comms} summarises the per-step communication volume
-of each strategy, where $M$ is the parameter count, $s$ is the element
-size in bytes, and $L$ is the number of transformer layers. These
-formulas are used in Section~\ref{sec:res_scale} to explain the
-observed scaling behaviour.
+A summary of the per-step communication volume for every strategy
+is collected in Table~\ref{tab:dist_comms}, with $M$ the parameter
+count, $s$ the per-element size in bytes, and $L$ the number of
+transformer layers. These formulas reappear in
+Section~\ref{sec:res_scale} as the tool that explains the observed
+scaling behaviour.
 
 \begin{table}[h]
 \centering
@@ -175,81 +187,89 @@ ZeRO-3    & $3Ms \cdot (P-1)/P$            & \texttt{all\_gather} + \texttt{redu
 \section{Methodology}\label{sec:dist_method}
 
 \subsection{Training Strategies and Metrics}\label{sec:dist_method_metrics}
-The four strategies selected for comparison cover the memory/throughput
-design space:
+The four strategies chosen for comparison span the memory and
+throughput design space:
 \begin{itemize}
-    \item \textbf{DP}---baseline, full replication;
-    \item \textbf{DDP}---industry-standard multi-GPU data parallelism;
-    \item \textbf{FSDP}---parameter-sharded data parallelism;
-    \item \textbf{DeepSpeed ZeRO-3}---fully sharded, with offload
-          options.
+    \item \textbf{DP}---the full-replication baseline;
+    \item \textbf{DDP}---the industry-standard form of multi-GPU
+          data parallelism;
+    \item \textbf{FSDP}---data parallelism with parameter sharding;
+    \item \textbf{DeepSpeed ZeRO-3}---fully sharded, with optional
+          CPU/NVMe offload.
 \end{itemize}
-Each strategy is evaluated along the following axes: GPU utilisation
-($\%$), peak and average memory consumption (GB per GPU), training-loss
-convergence per epoch, power consumption (W) and energy per epoch
-(kWh), communication overhead, and scaling efficiency.
+Each of them is then assessed along several axes: GPU utilisation
+in percent, peak and average per-GPU memory in GB, per-epoch
+training-loss convergence, average and peak power draw in watts
+together with the per-epoch energy in kWh, communication overhead,
+and scaling efficiency.
 
 \subsection{Workload}\label{sec:dist_method_workload}
-Two workloads are used to stress different regimes.
+Two workloads are used, each of which stresses a different regime.
 \begin{itemize}
     \item \textbf{Controlled benchmark.} ResNet-50 on CIFAR-10
-          ($25.6$M parameters), a widely reproducible workload that
-          exercises both compute-bound and communication-bound regimes
-          when batch sizes and worker counts are varied. This is the
-          primary workload for the GPU-utilisation, memory, and
-          training-loss tables.
-    \item \textbf{LLM benchmark.} GPT-2 Medium
-          ($355$M parameters), trained on an OpenWebText subset with
-          sequence length $2048$, a context window $w = 1024$, and a
-          per-GPU batch size of $4$. This workload is used to report
-          end-to-end LLM throughput in combination with SWFA
-          (Chapter~\ref{ch:swfa}).
+          ($25.6$M parameters), a widely reproducible setup that
+          swings between compute-bound and communication-bound
+          behaviour as the batch size and worker count are varied.
+          This is the main workload for the GPU-utilisation,
+          memory, and training-loss tables.
+    \item \textbf{LLM benchmark.} GPT-2 Medium ($355$M parameters),
+          trained on a subset of OpenWebText with sequence length
+          $2048$, a context window of $w = 1024$, and a per-GPU
+          micro-batch of four. This workload supplies the
+          end-to-end LLM throughput numbers when combined with the
+          SWFA kernel of Chapter~\ref{ch:swfa}.
 \end{itemize}
-The same random seed ($42$) and the same optimiser hyper-parameters
-(Adam, $\eta = 3\!\times\!10^{-4}$, $\beta_1 = 0.9$, $\beta_2 = 0.999$,
-$\varepsilon = 10^{-8}$) are used across all four strategies so that
-any difference in final loss is attributable to the strategy itself.
+The random seed ($42$) and the optimiser hyper-parameters (Adam,
+$\eta = 3 \times 10^{-4}$, $\beta_1 = 0.9$, $\beta_2 = 0.999$,
+$\varepsilon = 10^{-8}$) are identical across all four strategies,
+so that any divergence in the final loss can be attributed to the
+strategy itself and nothing else.
 
 \subsection{Hardware and Software}\label{sec:dist_method_hw}
-Experiments are carried out on a single node with:
+All experiments run on a single node whose configuration is:
 \begin{itemize}
-    \item 8$\times$ NVIDIA A100 (40\,GB HBM2e), NVLink-3 interconnect
-          at $600$\,GB/s bisection bandwidth;
-    \item Intel Xeon Platinum 8358 host CPUs (64 cores, 128 threads),
-          1\,TB DDR4;
-    \item PyTorch 2.0.1 + CUDA 11.8, NCCL 2.18.1, DeepSpeed 0.9.5;
-    \item NVIDIA driver $535.104.05$, GCC 11.4, CUTLASS 3.2.
+    \item 8$\times$ NVIDIA A100 (40\,GB HBM2e each), connected by
+          NVLink-3 with $600$\,GB/s of bisection bandwidth;
+    \item two Intel Xeon Platinum 8358 host CPUs
+          (64 cores, 128 threads total) backed by 1\,TB of DDR4;
+    \item PyTorch 2.0.1 with CUDA 11.8, NCCL 2.18.1, and DeepSpeed
+          0.9.5;
+    \item NVIDIA driver $535.104.05$, GCC 11.4, and CUTLASS 3.2.
 \end{itemize}
-Power and energy measurements are taken via the out-of-band BMC
-interface; GPU utilisation and per-GPU memory are read from
-\texttt{nvidia-smi} at 100\,ms intervals and aggregated over the epoch.
+Power and energy numbers are read off the out-of-band BMC
+interface; GPU utilisation and per-GPU memory are sampled from
+\texttt{nvidia-smi} every $100$\,ms and aggregated per epoch.
 
 \section{Implementations}\label{sec:dist_impl}
 
 \subsection{DP}\label{sec:impl_dp}
-The baseline DP implementation uses
-\texttt{torch.nn.DataParallel}, which replicates the model on every GPU,
-distributes non-overlapping data slices via a scatter operation,
-runs forward/backward locally, and synchronises via
-\texttt{all\_reduce} before each optimiser step. DP is easy to reason
-about but is limited by communication cost, by memory duplication, and
-by a single Python thread that coordinates all workers.
+The DP baseline uses \texttt{torch.nn.DataParallel}, which
+replicates the model onto every GPU, scatters non-overlapping
+slices of the data, performs the local forward and backward, and
+synchronises via \texttt{all\_reduce} immediately before each
+optimiser step. DP is conceptually transparent, but its throughput
+is held back by three factors: the communication cost of the full
+gradient, the memory cost of the replicated model, and the fact
+that a single Python thread is responsible for coordinating every
+worker.
 
 \subsection{DDP}\label{sec:impl_ddp}
-DDP exposes the same programming model as DP but internally:
+DDP offers the same user-facing programming model as DP, but
+internally it:
 \begin{itemize}
-    \item groups gradients into communication \emph{buckets} (default
-          $25$\,MB) so the all-reduce granularity matches the compute
-          granularity;
-    \item overlaps the reduction of earlier buckets with the backward
-          pass of later layers, using a hook-based mechanism attached to
-          each parameter;
-    \item uses a ring all-reduce topology to saturate the NVLink
-          bandwidth;
-    \item ties autograd's \texttt{reducer} into the CUDA stream so that
-          communication and compute run on non-default streams.
+    \item partitions the gradients into communication \emph{buckets}
+          of (by default) $25$\,MB so that the all-reduce
+          granularity lines up with the granularity at which the
+          backward pass produces them;
+    \item overlaps the reduction of the earlier buckets with the
+          backward pass of the later layers, using a per-parameter
+          hook;
+    \item routes those reductions around a ring all-reduce, which
+          is the collective that saturates NVLink;
+    \item hooks autograd's \texttt{reducer} into the CUDA stream so
+          that communication and compute occupy non-default streams.
 \end{itemize}
-Configuration in PyTorch is minimal:
+The PyTorch configuration is a one-liner:
 \begin{lstlisting}[language=Python]
 import torch.distributed as dist
 dist.init_process_group(backend="nccl")
@@ -259,17 +279,19 @@ model = torch.nn.parallel.DistributedDataParallel(
 \end{lstlisting}
 
 \subsection{FSDP}\label{sec:impl_fsdp}
-In FSDP the parameter tensor of each wrapped unit is sharded across
-devices:
+In FSDP every wrapped unit has its parameter tensor split across
+devices,
 \begin{equation}
     \mathrm{Shard}_i = \{\theta_j : j \bmod P = i\},
 \end{equation}
-where $P$ is the world size and $i$ the rank. Before forward/backward
-for a unit, FSDP issues an \emph{all-gather} to reconstruct the full
-parameter; after the gradient is computed, FSDP issues a
-\emph{reduce-scatter} and re-shards. Memory savings come from never
-holding the whole model on one device. The unit of sharding is a
-transformer block, wrapped via \texttt{auto\_wrap\_policy}:
+with $P$ the world size and $i$ the rank of the worker. Before the
+unit runs its forward or backward, FSDP issues an
+\emph{all-gather} that reassembles the full parameter; once the
+gradient has been computed, it issues a \emph{reduce-scatter} and
+re-shards the result. The memory saving comes directly from the
+fact that no worker ever holds the complete model at once. The
+sharding unit chosen here is the transformer block itself, wrapped
+via \texttt{auto\_wrap\_policy}:
 \begin{lstlisting}[language=Python]
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -281,16 +303,17 @@ model = FSDP(model, auto_wrap_policy=policy,
              sharding_strategy=ShardingStrategy.FULL_SHARD,
              device_id=local_rank)
 \end{lstlisting}
-For a transformer with $L$ layers, $L$ all-gather/reduce-scatter pairs
-are issued per step, which is why the unit of sharding has to coincide
-with the unit of compute.
+A transformer with $L$ layers therefore costs $L$
+all-gather/reduce-scatter pairs per step, which is precisely the
+reason the unit of sharding has to be aligned with the unit of
+compute.
 
 \subsection{DeepSpeed ZeRO-3}\label{sec:impl_ds}
-DeepSpeed ZeRO-3 extends parameter sharding with efficient
-communication scheduling and optional CPU/NVMe offloading of parameters
-and optimiser states. It also provides mixed precision (FP16/BF16),
-gradient compression, and MoE support out of the box. Configuration is
-via a JSON file:
+DeepSpeed ZeRO-3 augments parameter sharding with an efficient
+communication scheduler and with optional offload of parameters
+and optimiser state to CPU or NVMe. Mixed precision (FP16 or
+BF16), gradient compression, and MoE support are all provided
+out of the box. Configuration happens through a JSON file:
 \begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
 {
   "zero_optimization": {
@@ -305,9 +328,10 @@ via a JSON file:
   "gradient_accumulation_steps": 1
 }
 \end{lstlisting}
-The prefetch bucket controls how eagerly the next layer's parameters
-are gathered; setting it too large exhausts NVLink bandwidth on ZeRO-3,
-while setting it too small leaves compute units idle.
+The prefetch bucket governs how eagerly parameters for the next
+layer are gathered. Setting it too large saturates NVLink
+bandwidth on ZeRO-3; setting it too small leaves compute units
+idle waiting for the next all-gather.
 
 \section{Results}\label{sec:dist_results}
 
@@ -336,13 +360,14 @@ while setting it too small leaves compute units idle.
     \label{fig:gpu_utilization}
 \end{figure}
 
-DeepSpeed ZeRO-3 achieves the highest peak utilisation ($93.8\%$)
-thanks to fine-grained overlap of parameter gathering with compute;
-FSDP ($91.2\%$) and DDP ($89.7\%$) follow closely, while DP trails at
-$72.3\%$. The low average utilisation of DP ($18.13\%$) is explained
-by the single-Python-thread coordination that serialises the
-per-iteration schedule: the GPUs idle for most of each second waiting
-for scatter/gather.
+DeepSpeed ZeRO-3 reaches the highest peak utilisation at $93.8\%$,
+an outcome of the fine-grained overlap it can produce between
+parameter gathering and compute. FSDP follows at $91.2\%$ and DDP
+at $89.7\%$, with DP trailing at $72.3\%$. The explanation for DP's
+low average utilisation of $18.13\%$ is its coordination through a
+single Python thread, which serialises the per-iteration schedule
+and leaves the GPUs idle for most of each second while the thread
+orchestrates the scatter and gather steps.
 
 \subsection{Memory Usage}\label{sec:res_mem}
 \begin{table}[h]
@@ -361,11 +386,11 @@ DeepSpeed ZeRO-3        & 0.12  & 0.12  & 0.25  & 0.49 \\
 \end{tabular}
 \end{table}
 
-Sharding (FSDP, ZeRO-3) gives an $\approx 87.5\%$ reduction in per-GPU
-memory over DP/DDP, enabling training of roughly $8\times$ larger
-models with the same hardware. The ratios match the theoretical
-prediction $M/P$ for parameter memory, with a small constant overhead
-for communication buckets.
+The sharded strategies (FSDP, ZeRO-3) cut per-GPU memory by roughly
+$87.5\%$ relative to DP and DDP, making it possible to train models
+about $8\times$ larger on the same hardware. The ratios line up
+closely with the theoretical $M/P$ prediction for parameter memory,
+modulo a small constant overhead from the communication buckets.
 
 \subsection{Training-Loss Convergence}\label{sec:res_loss}
 \begin{figure}[H]
@@ -396,13 +421,14 @@ for communication buckets.
 \label{fig:loss_convergence}
 \end{figure}
 
-All four strategies converge, with final losses of $0.32$ (DP),
-$0.30$ (DDP), $0.28$ (FSDP), and $0.26$ (DeepSpeed). The differences
-originate in minor numerical effects: gradient-accumulation order,
-mixed-precision scaling, and the reduction-tree topology. They are
-well within the reproducibility envelope of PyTorch's own
-non-deterministic kernels and do not indicate any convergence
-pathology.
+Every one of the four strategies converges. The final losses are
+$0.32$ (DP), $0.30$ (DDP), $0.28$ (FSDP), and $0.26$ (DeepSpeed);
+the spread between them is explained by minor numerical effects---
+gradient-accumulation order, mixed-precision scaling, and the
+topology of the reduction tree. These gaps sit well within the
+reproducibility envelope of PyTorch's own non-deterministic
+kernels and therefore do not indicate any pathological behaviour on
+the part of one strategy.
 
 \subsection{Power and Energy}\label{sec:res_power}
 \begin{table}[h]
@@ -421,13 +447,14 @@ DeepSpeed ZeRO-3    & 2\,580 & 2\,980 & 0.78 & 1.22$\times$ \\
 \end{tabular}
 \end{table}
 
-Higher GPU utilisation correlates with lower energy per epoch;
-DeepSpeed delivers a $22\%$ improvement in per-epoch energy over DP.
-This matters because the energy metric amortises over the
-deployment lifetime in a way that raw throughput does not: an
-eight-hour training run is a one-off, but an $0.17$\,kWh saving per
-epoch aggregates to real savings over a multi-month pretraining
-campaign.
+A clear correlation shows up: higher GPU utilisation maps to
+lower per-epoch energy, and DeepSpeed delivers a $22\%$ energy
+improvement over DP. This matters because the energy metric
+amortises over the lifetime of a deployment in a way that raw
+throughput does not. An eight-hour training run is a one-time
+cost, but a per-epoch saving of $0.17$\,kWh translates into real
+savings when summed over a pretraining campaign that runs for
+months.
 
 \subsection{Scalability}\label{sec:res_scale}
 \begin{table}[h]
@@ -446,19 +473,21 @@ DeepSpeed ZeRO-3        & 8.4$\times$ & 8.0$\times$ & Excellent & 67.2 \\
 \end{tabular}
 \end{table}
 
-The \emph{Overall} score is the product of throughput scaling and
-memory efficiency, and it captures the ability of each strategy to
-train simultaneously bigger models \emph{and} bigger batches. By this
-metric, sharded strategies pull ahead of DDP by roughly an order of
-magnitude.
+The \emph{Overall} score multiplies throughput scaling by memory
+efficiency, and in doing so captures the degree to which each
+strategy lets one train both larger models \emph{and} larger
+batches at the same time. Measured this way, the sharded
+strategies leave DDP behind by roughly an order of magnitude.
 
 \subsection{Communication Overlap}\label{sec:res_overlap}
-Table~\ref{tab:overlap} reports the fraction of the per-step wall-clock
-time in which compute and communication overlap, measured via NCCL
-traces. DDP overlaps well because the ring all-reduce runs concurrently
-with the backward pass of earlier layers; ZeRO-3 overlaps less well
-because each layer has an explicit parameter-gather phase that blocks
-the compute, though the \texttt{overlap\_comm} option partially hides it.
+Table~\ref{tab:overlap} reports the fraction of the per-step
+wall-clock time during which compute and communication actually
+overlap, as extracted from NCCL traces. DDP overlaps well because
+the ring all-reduce can run concurrently with the backward pass of
+earlier layers; ZeRO-3 overlaps less well, because each layer
+carries an explicit parameter-gather phase that blocks subsequent
+compute, although the \texttt{overlap\_comm} option does hide a
+portion of that cost.
 
 \begin{table}[h]
 \centering
@@ -479,44 +508,48 @@ DeepSpeed       & 66 & 34 & 61 \\
 \section{Discussion and Recommendations}\label{sec:dist_discussion}
 
 \subsection{Strategy Choice}\label{sec:dist_choice}
-Based on the results above:
+On the basis of the results above, the recommendation is:
 \begin{itemize}
-    \item \textbf{Large models ($>$1\,B parameters).} DeepSpeed ZeRO-3
-          is the primary recommendation; FSDP is a close alternative
-          with a simpler PyTorch-native deployment and fewer moving
-          parts in the build.
-    \item \textbf{Medium models (100\,M--1\,B).} DDP offers the best
-          performance/complexity trade-off; FSDP is preferred when
-          memory is tight or when experimenting with longer sequences
-          that inflate activations.
-    \item \textbf{Small models ($<$100\,M).} DDP is sufficient; DP
-          remains useful only for debugging and first-time bring-up.
+    \item \textbf{Large models ($>$1\,B parameters).} DeepSpeed
+          ZeRO-3 is the primary recommendation. FSDP is a close
+          alternative with a cleaner PyTorch-native deployment
+          story and fewer moving parts in the build.
+    \item \textbf{Medium models ($100$\,M--$1$\,B).} DDP offers
+          the best trade-off between performance and complexity.
+          FSDP is to be preferred when memory is tight or when
+          longer sequences inflate the activation footprint.
+    \item \textbf{Small models ($<$100\,M).} DDP is already
+          sufficient. DP remains useful only for debugging and
+          for first-time bring-up.
 \end{itemize}
 
 \subsection{When Overlap Wins}\label{sec:dist_overlap_wins}
-The overlap numbers in Table~\ref{tab:overlap} explain why DDP trails
-FSDP and DeepSpeed only slightly in GPU utilisation despite carrying a
-larger memory footprint: the ring all-reduce is the most
-compute-friendly collective on NVLink, and bucket-level scheduling
-keeps the wire full. Sharded strategies pay a latency premium for the
-additional all-gather but more than make up for it through the
-$8\times$ memory headroom that enables larger batches and thus better
-compute/memory balance.
+The overlap figures in Table~\ref{tab:overlap} explain why DDP
+falls only marginally behind FSDP and DeepSpeed in GPU utilisation
+despite carrying a larger memory footprint. The ring all-reduce is
+the most compute-friendly collective available on NVLink, and
+bucket-level scheduling is enough to keep the wire busy. The
+sharded strategies do pay a latency premium for the extra
+all-gather, but they more than recover it through the roughly
+$8\times$ memory headroom, which in turn enables larger batches and
+a better balance between compute and memory pressure.
 
 \subsection{Limitations}\label{sec:dist_limitations}
-The study is confined to a single NVLink-connected node; multi-node
-scaling introduces an InfiniBand layer whose latency characteristics
-would shift the balance towards strategies that reduce the volume of
-cross-node traffic (pipeline parallelism, gradient compression,
-2-D sharding schemes like Megatron-3D). These are noted as future
-work in Chapter~\ref{ch:conclusion}.
+This study is restricted to a single NVLink-connected node.
+Multi-node scaling brings an InfiniBand layer into the picture
+whose latency characteristics would tilt the balance toward
+strategies that minimise cross-node traffic---pipeline parallelism,
+gradient compression, and 2-D sharding schemes such as Megatron-3D.
+These directions are noted as future work in
+Chapter~\ref{ch:conclusion}.
 
 \section{Summary}\label{sec:dist_summary}
-This chapter provided a controlled comparison of four distributed
-training strategies on a common hardware and workload. Sharded
-strategies (FSDP, ZeRO-3) dominate along every axis except raw
-simplicity, and DeepSpeed's aggressive prefetching edges out FSDP on
-NVLink. The same underlying GPU kernels---GEMMs and attention---are
-exercised by all four strategies, which motivates the next two
-chapters: if the kernel layer is inefficient, all four training
-schedules inherit that inefficiency at every scale.
+The chapter presented a controlled comparison of four distributed
+training strategies on a common hardware configuration and a common
+workload. The sharded strategies---FSDP and ZeRO-3---dominate along
+every axis except raw simplicity, and DeepSpeed's aggressive
+prefetching just edges out FSDP on NVLink. All four strategies rest
+on the same kernel primitives (GEMMs and attention), and that is
+exactly what motivates the next two chapters: any inefficiency in
+the kernel layer is inherited by every training schedule at every
+scale.

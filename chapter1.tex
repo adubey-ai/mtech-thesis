@@ -1,82 +1,94 @@
 \chapter{Introduction}\label{ch:introduction}
 
 \section{Background and Motivation}\label{sec:intro_background}
-Large Language Models built on the transformer
-architecture~\cite{vaswani2017attention} have, in the span of a handful
-of years, moved from a research curiosity to the primary workload of
-most new supercomputing deployments. The trajectory from GPT-3's
-$175$-billion parameters~\cite{brown2020gpt3} through PaLM's
-$540$-billion~\cite{chowdhery2022palm} and the open-weight LLaMA
-series~\cite{touvron2023llama,touvron2023llama2} is less a qualitative
-jump at each step than a straightforward consequence of the scaling
-laws~\cite{kaplan2020scaling,hoffmann2022chinchilla}: for any given
-compute budget the loss-minimising model is larger and trained on
-more data than the previous-generation wisdom suggested. The
-engineering consequence is that every new model generation
-simultaneously tightens the memory budget of a single GPU, widens
-the communication demand across a distributed cluster, and
-lengthens the context windows on which the attention operator is
-evaluated~\cite{rajbhandari2019zero,shoeybi2019megatron}. A software
-stack that was adequate for the previous model generation is
-rarely adequate for the next one without retuning at every layer.
+Within only a few years, Large Language Models---all of them
+descendants of the transformer design~\cite{vaswani2017attention}---have
+shifted from an interesting research artefact to the workload that
+dominates most newly installed supercomputing clusters. When one
+traces the path from the $175$-billion parameters of
+GPT-3~\cite{brown2020gpt3}, through the $540$-billion of
+PaLM~\cite{chowdhery2022palm}, and into the open-weight LLaMA
+line~\cite{touvron2023llama,touvron2023llama2}, each new model is
+not so much a qualitative leap as a direct reading of the compute-loss
+scaling relationships~\cite{kaplan2020scaling,hoffmann2022chinchilla}:
+whatever the compute budget, the model that best minimises the loss
+turns out to be bigger, and fed more tokens, than the previous
+generation of folklore had assumed. From an engineering point of view,
+the implication is painful: every generation tightens the
+per-device memory budget, raises the communication volume demanded
+of the cluster, and stretches the context lengths on which attention
+has to be computed~\cite{rajbhandari2019zero,shoeybi2019megatron}. A
+stack that sufficed for the previous generation almost never suffices
+for the next one without being retuned from top to bottom.
 
 \subsection{A Concrete Memory Accounting}\label{sec:intro_memory_example}
-A single back-of-the-envelope estimate makes the stakes tangible. For a
-$7$-billion-parameter transformer trained with the Adam optimiser in FP16
-mixed precision, the per-parameter memory footprint is
-$2$\,B (parameter) $+ 2$\,B (gradient) $+ 4 \cdot 2$\,B (FP32 master copy
-and the two Adam moments) $= 14$\,B, or roughly $98$\,GB just to hold the
-model state. A single A100-$40$\,GB cannot hold this state---let alone
-the activations, which at sequence length $N{=}2048$ and batch $B{=}4$
-add a further $\sim\!20$\,GB per layer. A $70$-billion-parameter model
-multiplies the state budget by ten and the activation budget by three,
-because $d_{\text{model}}$ and the number of layers both grow. Memory
-is therefore the first-order constraint on \emph{what can be trained at
-all}, and it is the constraint that drives every sharding decision in
-this thesis.
+A short back-of-the-envelope calculation is enough to make the
+constraints concrete. Consider a $7$-billion-parameter transformer
+trained in FP16 mixed precision with Adam. Each parameter then costs
+$2$\,B for the weight itself, another $2$\,B for its gradient, and
+$4 \cdot 2$\,B more for the FP32 master copy together with the two
+moment buffers that Adam keeps---$14$\,B per parameter in total, or
+about $98$\,GB merely for the persistent model state. That figure
+already exceeds the $40$\,GB HBM of a single A100, and it ignores
+activations, which at a sequence of $N{=}2048$ and a batch of $B{=}4$
+contribute roughly a further $20$\,GB per transformer layer. Scaling
+to a $70$-billion-parameter model enlarges the state budget by a factor
+of ten and the activation budget by about three---both $d_{\text{model}}$
+and the depth climb. Memory, in other words, is the first-order
+constraint on \emph{what can be trained at all}, and it is precisely
+the constraint that determines every sharding decision made in this
+thesis.
 
 \subsection{The Four Challenges That Motivate This Thesis}\label{sec:intro_four_challenges}
 
-Modern LLMs require resources that far exceed the capability of a single
-GPU. Training models such as PaLM or LLaMA-3 necessitates distributed
-computing across hundreds or thousands of accelerators. Four interacting
-challenges arise as soon as one moves beyond a single GPU:
+Today's LLMs demand an amount of hardware that no single GPU can
+supply. Systems such as PaLM or LLaMA-3 cannot be trained at all
+without spreading the job across hundreds, sometimes thousands, of
+accelerators. The moment one steps beyond a single device, four
+mutually coupled difficulties appear at once:
 \begin{itemize}
-    \item \textbf{Memory management.} Model parameters, gradients, and
-          optimiser states for a $7$-billion parameter LLM already exceed
-          the $40$\,GB HBM of a single A100. Adam~\cite{rasley2020deepspeed}
-          requires two additional optimiser tensors per parameter (first
-          and second moments), tripling the parameter memory; mixed
-          precision training~\cite{micikevicius2018amp} requires an
-          additional FP32 master copy.
-    \item \textbf{Communication overhead.} Gradient synchronisation over a
-          data-parallel group scales with the model size, not the batch
-          size. Without careful overlap of communication and compute, the
-          accelerators spend a majority of their time waiting on NVLink
-          or InfiniBand.
-    \item \textbf{Hardware heterogeneity.} Production stacks must support
-          diverse hardware (A100, H100, Intel Xe, AMD CDNA) with different
-          memory hierarchies, Tensor-Core instructions, and interconnects.
-          The same training job can exhibit markedly different performance
-          profiles on different SKUs.
-    \item \textbf{Attention efficiency.} The $\mathcal{O}(N^2)$ complexity
-          of self-attention dominates the FLOPs of long-context models.
-          Simple masking of an element-wise sparse pattern is insufficient,
-          because dense GEMMs are still issued over blocks that are
-          subsequently zeroed out.
+    \item \textbf{Memory management.} Even a $7$-billion parameter
+          model, once its weights, gradients, and optimiser state are
+          counted, overruns the $40$\,GB HBM available on one A100.
+          Adam-style updates~\cite{rasley2020deepspeed} attach two
+          extra tensors---the first and second moment estimates---to
+          every parameter, effectively tripling the parameter storage,
+          and mixed-precision recipes~\cite{micikevicius2018amp}
+          additionally demand a separate FP32 master copy.
+    \item \textbf{Communication overhead.} The cost of synchronising
+          gradients across a data-parallel group is a function of the
+          model's size rather than the batch's; unless communication
+          is deliberately overlapped with compute, the accelerators
+          sit idle waiting on NVLink or InfiniBand for most of the
+          step.
+    \item \textbf{Hardware heterogeneity.} A production stack is
+          expected to run on a heterogeneous fleet---A100, H100,
+          Intel Xe, AMD CDNA---each with its own memory hierarchy,
+          its own Tensor-Core or matrix-engine ISA, and its own
+          interconnect topology, so that the same training job can
+          behave very differently depending on the SKU it happens
+          to land on.
+    \item \textbf{Attention efficiency.} Self-attention contributes
+          $\mathcal{O}(N^2)$ work and, at long context, dominates the
+          overall FLOP count. Masking an element-wise sparse pattern
+          after the fact is not enough: the underlying dense GEMM is
+          still dispatched over blocks whose outputs are later
+          discarded.
 \end{itemize}
 
-The carbon and energy cost of training~\cite{patterson2021carbon} further
-amplifies the importance of efficiency: any $10\%$ improvement in compute
-utilisation translates directly into a $10\%$ reduction in electricity
-consumption and in embodied carbon. Optimisations that simultaneously
-reduce wall-clock time and energy per epoch are therefore valuable beyond
-their direct performance benefit.
+On top of all this sits the energy and carbon footprint of
+training~\cite{patterson2021carbon}. The accounting here is almost
+linear: a $10\%$ gain in compute utilisation translates more or less
+directly into a $10\%$ saving in electricity and embodied carbon. Any
+optimisation that cuts wall-clock time and energy per epoch
+simultaneously therefore has value that extends well beyond its raw
+speedup.
 
 \subsection{A Stack View of the Problem}\label{sec:intro_stack}
-Throughout this thesis we treat LLM efficiency not as a single
-algorithmic question but as a \emph{stack} of co-dependent layers, each
-of which must be tuned against the layer above and the layer below:
+In what follows, LLM efficiency is never treated as a single
+algorithmic problem. It is treated as a \emph{stack} of interdependent
+layers, each of which has to be tuned with one eye on the layer
+above it and the other on the layer below:
 \begin{enumerate}
     \item \textbf{Distributed schedule} (Chapter~\ref{ch:distributed}).
           Decides which parts of the model, gradients, and optimiser
@@ -102,51 +114,62 @@ of which must be tuned against the layer above and the layer below:
           expected performance, and it selects per-shape kernel
           parameters that would otherwise have to be hand-tuned.
 \end{enumerate}
-This view has two consequences that inform every chapter. First, a
-point optimisation at one layer is only as useful as the layer above
-allows it to be: a kernel speedup disappears if the distributed
-schedule serialises it behind a slow collective. Second, a measurement
-at one layer is only as trustworthy as the cross-check at the layer
-below: a higher-level throughput number can hide a kernel regression
-that a lower-level profiler would have caught. The profiling pipeline
-of Chapter~\ref{ch:triton} is therefore treated as a first-class
-deliverable, not as a side-tool.
+Two consequences of this perspective reappear in every chapter.
+First, no point optimisation at one layer is more useful than the
+next layer up permits it to be---a kernel speedup is wasted if a
+slow collective in the distributed schedule serialises everything
+behind it. Second, a measurement at one layer is only as reliable
+as the independent check performed one layer below it; a
+throughput figure at the top can easily conceal a regression in a
+kernel that a lower-level profile would have caught immediately.
+For these reasons the profiling pipeline described in
+Chapter~\ref{ch:triton} is treated as a first-class component of
+the contribution, not as a convenient side tool.
 
 \section{Problem Statement}\label{sec:intro_problem}
-The primary problems addressed in this thesis are as follows.
+The questions this thesis sets out to answer are the following.
 \begin{enumerate}
-    \item \textbf{Scalable distributed training.} Existing comparisons of
-          DP, DDP, FSDP, and DeepSpeed ZeRO-3 are typically published by
-          the authors of each system, each under a different workload and
-          a different hardware configuration. A controlled single-node
-          study that fixes the model, the dataset, the random seed, and
-          the hardware, and varies only the parallelisation strategy, is
-          missing from the literature.
-    \item \textbf{High-performance matrix multiplication.} Vendor cuBLAS
-          kernels are highly tuned for large square GEMMs but are
-          suboptimal for skinny, batched, and grouped shapes---precisely
-          the shapes that dominate transformer attention and
-          Mixture-of-Experts layers. A principled mapping of LLM GEMMs
-          onto the CUTLASS/CuTe abstraction is required.
+    \item \textbf{Scalable distributed training.} The comparisons of
+          DP, DDP, FSDP, and DeepSpeed ZeRO-3 that one finds in the
+          published literature are, almost without exception, produced
+          by the authors of the individual system, usually on a
+          different workload and a different hardware configuration
+          each time. What the literature does not contain is a
+          controlled single-node study in which the model, the data,
+          the seed, and the hardware are all held fixed and only the
+          parallelisation strategy is varied.
+    \item \textbf{High-performance matrix multiplication.} The GEMM
+          kernels in vendor libraries such as cuBLAS are tuned
+          aggressively for large, square matrices and behave worse
+          for the skinny, batched, and grouped shapes that in fact
+          dominate transformer attention and Mixture-of-Experts
+          layers. What is needed is a principled mapping of the
+          GEMM shapes that LLMs actually produce onto the
+          CUTLASS/CuTe abstractions.
     \item \textbf{Attention optimisation.} Sliding-window
-          attention~\cite{beltagy2020longformer} has become ubiquitous in
-          long-context models, yet most open-source implementations apply
-          the window as a post-hoc element-wise mask. A kernel that
-          exploits the window structure \emph{before} computing scores
-          would yield near-linear scaling in the window size.
-    \item \textbf{Production-grade serving kernels.} LLM inference is
-          qualitatively different from training: requests arrive
-          asynchronously, prompts share large prefixes, and the decode
-          phase is memory-bound. Kernel optimisations for the SGLang
-          runtime---paged KV cache, fused decode attention, fused
-          sampling---are needed to turn algorithmic savings into wall-clock
-          serving throughput.
-    \item \textbf{Kernel profiling and tuning.} Kernel-level performance
-          decisions (block sizes, pipeline stages, warp counts) need to be
-          revisited for every new GPU generation and every new input
-          shape. A uniform profiling pipeline that crosses Triton,
-          CUTLASS, and Torch-inductor is required to keep these decisions
-          current.
+          attention~\cite{beltagy2020longformer} has become almost
+          universal in long-context models, yet most open
+          implementations express the window by applying an
+          element-wise mask \emph{after} computing the scores. A
+          kernel that recognises the window pattern \emph{before}
+          any GEMM is issued would, by contrast, scale near-linearly
+          in the window size.
+    \item \textbf{Production-grade serving kernels.} LLM inference
+          has a different character from training. Requests arrive
+          asynchronously, prompts frequently share long prefixes,
+          and the decode stage is memory-bound rather than
+          compute-bound. Closing the gap between the algorithmic
+          savings that are available on paper and the wall-clock
+          throughput observed in a running service requires kernel
+          work inside the SGLang runtime---a paged KV cache, a
+          fused decode attention, and fused sampling primitives.
+    \item \textbf{Kernel profiling and tuning.} Every new GPU
+          generation and every new input shape invalidates the
+          previous best choice of block size, pipeline depth, or
+          warp count. A single profiling pipeline that can reason
+          across Triton, CUTLASS, and Torch-inductor is therefore
+          needed so that these kernel-level decisions do not have
+          to be rediscovered from scratch.
 \end{enumerate}
 
 \section{Objectives}\label{sec:intro_objectives}
@@ -222,29 +245,32 @@ The main contributions of this thesis are as follows.
 \end{itemize}
 
 \section{Scope of the Work}\label{sec:intro_scope}
-The experimental evaluation in this thesis focuses on NVIDIA A100 GPUs in
-an 8-GPU NVLink-connected server, with cross-checks on CPU where relevant
-(notably for the SWFA numerical accuracy tests). Distributed training is
-evaluated on ResNet-50/CIFAR-10 as a controlled proxy and on a GPT-2
-Medium-class model ($355$M parameters) for end-to-end LLM throughput
-measurements. The SWFA kernel is implemented in PyTorch with CPU-optimised
-paths and is prototyped for a later CUTLASS/Triton port; correctness is
-established on the reference implementation.
+All experiments reported here are run on NVIDIA A100 GPUs housed in
+an 8-GPU NVLink-connected server, with the CPU used as a
+cross-checking reference wherever it is relevant---most importantly
+during the SWFA numerical accuracy tests. For the distributed
+training study, ResNet-50 on CIFAR-10 serves as a small, controlled
+proxy, while a GPT-2 Medium-class model of about $355$M parameters
+drives the end-to-end LLM throughput numbers. The SWFA kernel itself
+is written in PyTorch, with CPU-optimised paths, and the code base
+is structured so that a CUTLASS/Triton port can be slotted in later;
+correctness is established on the reference implementation.
 
-The work deliberately does not cover: (i) multi-node scaling, which is
-left as future work in Chapter~\ref{ch:conclusion}; (ii) inference
-quantisation below $8$ bits, which is orthogonal to the kernel-level
-optimisations studied here; and (iii) reinforcement-learning-from-human-%
-feedback (RLHF) or alignment workloads, which exercise different
-bottlenecks. Where relevant, pointers to the relevant literature are
-given so that the findings of this thesis can be placed in the broader
-context.
+A number of topics are deliberately left outside the scope of this
+thesis: (i) multi-node scaling, which is flagged as future work in
+Chapter~\ref{ch:conclusion}; (ii) inference quantisation below
+$8$~bits, which is largely orthogonal to the kernel-level
+optimisations on which this thesis concentrates; and
+(iii) alignment and RLHF workloads, whose bottlenecks are quite
+different. For each of these, the relevant literature is pointed to
+so that the results of this thesis can be located within the wider
+picture.
 
 \section{Methodology Overview}\label{sec:intro_methodology}
-Each technical chapter (Chapters~\ref{ch:distributed}--\ref{ch:triton})
-follows a uniform internal structure that makes it possible to read any
-chapter in isolation while still understanding how it fits into the
-overall stack:
+Every technical chapter from Chapter~\ref{ch:distributed} through
+Chapter~\ref{ch:triton} obeys the same internal layout, so that any
+one of them can be read on its own without losing sight of how it
+plugs into the larger stack:
 \begin{enumerate}
     \item \textbf{Background.} A concise restatement of the relevant
           concepts, calibrated to the specific layer of the stack.
@@ -262,9 +288,10 @@ overall stack:
     \item \textbf{Discussion.} A brief discussion of what the numbers
           mean and how they compose with the rest of the stack.
 \end{enumerate}
-This structure keeps the experimental setup alongside the measurements it
-produces and avoids a single monolithic methodology chapter that would
-otherwise span five unrelated systems.
+Keeping the experimental setup adjacent to the measurements it
+generates---rather than collapsing everything into one monolithic
+methodology chapter spanning five unrelated systems---makes the
+numbers easier to audit and easier to reproduce in isolation.
 
 \section{Timeline}\label{sec:intro_timeline}
 The work reported in this thesis was carried out in four phases:
@@ -288,13 +315,14 @@ The work reported in this thesis was carried out in four phases:
 \end{enumerate}
 
 \section{Thesis Organisation}\label{sec:intro_organisation}
-Figure~\ref{fig:intro_stack} summarises the logical dependency between
-the chapters. Each technical chapter both \emph{consumes} the
-abstraction below it and \emph{produces} an abstraction for the chapter
-above: for example, Chapter~\ref{ch:cutlass} delivers a GEMM primitive
-that Chapter~\ref{ch:swfa} uses inside its block-wise attention kernel,
-and Chapter~\ref{ch:sglang} in turn plugs that attention kernel into a
-full serving runtime.
+The logical dependencies between chapters are collected in
+Figure~\ref{fig:intro_stack}. Each technical chapter both
+\emph{consumes} the abstraction provided by the one below it and
+\emph{produces} a new abstraction for the one above: the GEMM
+primitive built in Chapter~\ref{ch:cutlass}, for instance, is
+re-used as the inner GEMM of the block-wise attention kernel in
+Chapter~\ref{ch:swfa}, which itself is then plugged into the full
+serving runtime of Chapter~\ref{ch:sglang}.
 
 \begin{figure}[H]
     \centering
@@ -331,64 +359,68 @@ full serving runtime.
     \label{fig:intro_stack}
 \end{figure}
 
-\noindent The remainder of the thesis is organised as follows.
+\noindent The rest of the thesis proceeds in the following way.
 \begin{itemize}
     \item \textbf{Chapter~\ref{ch:litreview} --- Literature Review.}
-          Surveys prior work on distributed training, GEMM libraries,
-          efficient attention, LLM serving systems, and GPU kernel
-          profiling. Positions this thesis against the open gaps in
-          that literature and introduces the vocabulary used
-          throughout.
+          Reviews the prior art across distributed training, GEMM
+          libraries, efficient-attention mechanisms, LLM serving
+          systems, and GPU kernel profiling, locates the present
+          work against the gaps that survey reveals, and sets up
+          the vocabulary used in subsequent chapters.
     \item \textbf{Chapter~\ref{ch:distributed} --- Distributed
-          Computing and Training.} Presents the distributed-training
-          methodology and controlled comparison of DP, DDP, FSDP, and
-          DeepSpeed ZeRO-3 on an 8-GPU A100 node. Establishes which
-          parallelisation strategy maximises GPU utilisation and
-          minimises energy per epoch on a fixed workload, and produces
-          the per-layer memory budget that the rest of the stack must
-          respect.
+          Computing and Training.} Develops the methodology and then
+          runs the controlled comparison among DP, DDP, FSDP, and
+          DeepSpeed ZeRO-3 on the 8-GPU A100 node. The chapter
+          identifies which strategy yields the highest GPU
+          utilisation and the lowest energy per epoch on a common
+          workload, and fixes the per-layer memory budget that the
+          remaining layers of the stack must live within.
     \item \textbf{Chapter~\ref{ch:cutlass} --- CUTLASS and CuTe GEMM
-          Operations.} Describes GEMM operations built on CUTLASS and
-          the CuTe layout algebra, and maps the dense LLM
-          computations (QKV, attention score/output, MLP, grouped-MoE)
-          onto the Tensor-Core hierarchy. The epilogue fusions
-          introduced here reappear in Chapters~\ref{ch:swfa}
-          and~\ref{ch:sglang} as the writeback path of the
-          attention-output GEMM and the logit-projection GEMM,
-          respectively.
+          Operations.} Covers GEMM kernels built on top of CUTLASS
+          together with the CuTe layout algebra, and then maps the
+          dense operations in an LLM---QKV, attention score and
+          output, MLP, and grouped MoE---onto the Tensor-Core
+          hierarchy. The epilogue fusions developed here reappear
+          later as the writeback path of the attention-output GEMM
+          in Chapter~\ref{ch:swfa} and of the logit-projection GEMM
+          in Chapter~\ref{ch:sglang}.
     \item \textbf{Chapter~\ref{ch:swfa} --- Sliding Window Flash
-          Attention.} Introduces the SWFA algorithm, including
-          block classification, vectorised mask generation, forward
-          and backward passes, and a closed-form optimal-window
-          derivation with a proof of strict convexity. SWFA consumes
-          the GEMM primitives of Chapter~\ref{ch:cutlass} and is later
-          plugged into the prefill kernel of
+          Attention.} Presents SWFA: the block classifier, the
+          vectorised mask generator, the forward and backward
+          passes, and a closed-form expression for the optimal
+          window size accompanied by a proof that the associated
+          loss is strictly convex. SWFA consumes the GEMM primitives
+          of Chapter~\ref{ch:cutlass} and is slotted, later in the
+          thesis, into the prefill kernel of
           Chapter~\ref{ch:sglang}.
     \item \textbf{Chapter~\ref{ch:sglang} --- GPU Kernels in the
-          SGLang Runtime.} Describes the serving-side component of
-          the stack: paged KV cache, fused decode attention, SWFA
-          prefill, and fused top-$k$/top-$p$ sampling. A layered
-          evaluation decomposes the cumulative decode-throughput
-          speedup into per-optimisation contributions.
+          SGLang Runtime.} Addresses the serving-side of the stack:
+          the paged KV cache, the fused decode attention, the SWFA
+          prefill kernel, and fused top-$k$/top-$p$ sampling. A
+          layered ablation then decomposes the cumulative decode
+          speedup into the share contributed by each individual
+          optimisation.
     \item \textbf{Chapter~\ref{ch:triton} --- Triton Kernel Profiling
-          and Auto-tuning.} Covers the Triton-based profiling and
-          auto-tuning pipeline that cross-validates the CUTLASS
-          numbers of Chapter~\ref{ch:cutlass}, the SWFA numbers of
+          and Auto-tuning.} Introduces the Triton-based profiling
+          and auto-tuning pipeline that serves as an independent
+          cross-check on the CUTLASS numbers of
+          Chapter~\ref{ch:cutlass}, the SWFA numbers of
           Chapter~\ref{ch:swfa}, and the serving numbers of
           Chapter~\ref{ch:sglang}. The shape-indexed configuration
-          cache introduced here is the mechanism by which the
-          kernel-level decisions remain valid as shapes and
-          hardware generations change.
+          cache introduced here is the mechanism that keeps the
+          kernel-level decisions valid as shapes and hardware
+          generations evolve.
     \item \textbf{Chapter~\ref{ch:conclusion} --- Conclusions and
-          Future Work.} Summarises the contributions, distils the
-          lessons that composed across chapters, and outlines
-          short-, medium-, and long-term research directions.
+          Future Work.} Recaps the contributions, extracts the
+          cross-chapter lessons, and lays out near-, medium-, and
+          long-term research directions.
 \end{itemize}
 
-Algorithmic pseudocode, reference PyTorch listings, and
-reproduction-ready hardware/software details are collected in
-Appendix~A; full proofs of the theoretical results stated in the main
-text are collected in Appendix~B. Each result in the main text is
-cross-linked to its proof, and each algorithm is cross-linked to its
-reference implementation, so that any claim in the thesis can be
-traced to its evidence in at most two clicks.
+Algorithmic pseudocode, the accompanying reference PyTorch listings,
+and the hardware/software details needed to reproduce the
+experiments are gathered in Appendix~A. The full proofs of the
+theoretical claims made in the main text are kept together in
+Appendix~B. Every theorem in the main text carries a link to its
+proof, and every algorithm carries a link to its reference code, so
+that any statement in the thesis can be traced back to its
+supporting evidence in at most two clicks.

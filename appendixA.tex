@@ -1,17 +1,19 @@
 \chapter{Algorithms and Reference Implementations}
 \label{chp:appA}
 
-This appendix collects the full algorithmic pseudocode and the
-reference PyTorch/Triton implementations that accompany the chapters
-of the main text. The listings are written so that each can be lifted
-into a fresh environment, compiled, and reproduced independently.
+This appendix gathers, in one place, the complete algorithmic
+pseudocode and the reference PyTorch and Triton implementations
+that accompany the main chapters. Each listing is self-contained
+and written so that it can be dropped into a fresh environment,
+compiled, and reproduced independently.
 
 \section{Block Classification}\label{app:classify}
 
-The block classification routine of Chapter~\ref{ch:swfa} partitions
-the $T_r \times T_c$ grid of attention blocks into three disjoint
-sets: \emph{inside}, \emph{intersecting}, and \emph{outside}. The
-routine is $\mathcal{O}(T_r T_c)$ in arithmetic operations.
+The block classifier of Chapter~\ref{ch:swfa} takes the
+$T_r \times T_c$ grid of attention blocks and sorts them into
+three disjoint sets---\emph{inside}, \emph{intersecting}, and
+\emph{outside}---using a total of $\mathcal{O}(T_r T_c)$
+arithmetic operations.
 
 \begin{algorithm}[H]
     \caption{\textsc{ClassifyBlocks}: detailed reference.}
@@ -67,9 +69,10 @@ def classify_blocks(N, wl, wr, Br, Bc):
 
 \section{Vectorised Mask Generation}\label{app:mask}
 
-The vectorised mask generator (Algorithm~\ref{alg:swfa_mask}) avoids
-the nested $\mathcal{O}(B_r B_c)$ loop by constructing the mask as the
-logical OR of a \texttt{triu} and a \texttt{tril}.
+The vectorised mask generator of Algorithm~\ref{alg:swfa_mask}
+sidesteps the nested $\mathcal{O}(B_r B_c)$ loop entirely by
+forming the mask as the logical OR of a \texttt{triu} and a
+\texttt{tril}.
 
 \begin{algorithm}[H]
     \caption{\textsc{GenerateMask}: reference version.}
@@ -244,8 +247,8 @@ def swfa_forward(Q, K, V, wl, wr, Br=16, Bc=16, eps=1e-6):
 \section{Distributed-Training Reference
 Scripts}\label{app:dist_scripts}
 
-The DP/DDP/FSDP/ZeRO-3 skeletons used in
-Chapter~\ref{ch:distributed} are collected below.
+The skeletons of the DP, DDP, FSDP, and ZeRO-3 launchers used in
+the study of Chapter~\ref{ch:distributed} are listed below.
 
 \subsection{DDP Launcher}
 \begin{lstlisting}[language=Python,basicstyle=\ttfamily\scriptsize]
@@ -363,8 +366,9 @@ using GroupGemm = cutlass::gemm::device::GemmGrouped<
 
 \section{Triton SWFA Kernel}\label{app:triton_swfa}
 
-The Triton implementation of SWFA used for the cross-validation in
-Section~\ref{sec:triton_swfa} is reproduced below in full.
+The full Triton implementation of SWFA used for the
+cross-validation of Section~\ref{sec:triton_swfa} is reproduced
+below.
 
 \begin{lstlisting}[language=Python,basicstyle=\ttfamily\scriptsize]
 import triton
@@ -436,7 +440,8 @@ def swfa_fwd_kernel(Q, K, V, O, L, M,
 
 \section{Numerical Validation Harness}\label{app:validation}
 
-The harness used to produce Table~\ref{tab:swfa_accuracy} follows.
+The validation harness that produced
+Table~\ref{tab:swfa_accuracy} is listed below.
 
 \begin{lstlisting}[language=Python,basicstyle=\ttfamily\scriptsize]
 import torch, math
