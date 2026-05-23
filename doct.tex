@@ -10,6 +10,7 @@
 \usepackage{csquotes}
 \usepackage{listings}
 \usepackage{float}
+\usepackage{placeins}
 
 \lstset{
     basicstyle=\ttfamily\footnotesize,
@@ -19,13 +20,22 @@
     numberstyle=\tiny
 }
 
+% Prefer flexible placement for algorithms to reduce white space.
+\makeatletter
+\def\fps@algorithm{htbp}
+\makeatother
+
+\newcommand{\thesismonthyear}{%
+    \ifcase\month\or January\or February\or March\or April\or May\or June\or July\or August\or September\or October\or November\or December\fi\ \number\year
+}
+
 \title{High-Performance Deep Learning Software Stack for Scalable and Efficient LLMs}
 \author{Adarsh Dubey}
 \studentid{SC24M151}
 \advisor{Dr.\ S.\ Sumitra}
 \specialization{Machine Learning and Computing}
 \department{Mathematics}
-\date{\today}
+\date{\thesismonthyear}
 
 
 %% ---- Document starts here ---- %%
