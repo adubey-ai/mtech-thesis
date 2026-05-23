@@ -126,6 +126,7 @@ def generate_mask(r, c, Br, Bc, wl, wr, device="cpu"):
 \section{Full SWFA Forward Pass}\label{app:forward}
 
 \begin{algorithm}[H]
+    \small
     \caption{\textsc{SWFA-Forward}: full expanded reference.}
     \label{alg:appendix_forward}
     \KwIn{$Q, K, V$; $(w_l, w_r)$; $(B_r, B_c)$; $\varepsilon > 0$.}
@@ -161,7 +162,7 @@ def generate_mask(r, c, Br, Bc, wl, wr, device="cpu"):
 
 \subsection{Reference PyTorch Implementation (CPU path)}
 
-\begin{lstlisting}[language=Python,basicstyle=\ttfamily\scriptsize]
+\begin{lstlisting}[language=Python,basicstyle=\ttfamily\tiny]
 def swfa_forward(Q, K, V, wl, wr, Br=16, Bc=16, eps=1e-6):
     """Single-head sliding-window flash attention (CPU reference).
     Q, K: [N, d];  V: [N, dv]
@@ -203,6 +204,7 @@ def swfa_forward(Q, K, V, wl, wr, Br=16, Bc=16, eps=1e-6):
 \section{Full SWFA Backward Pass}\label{app:backward}
 
 \begin{algorithm}[H]
+    \small
     \caption{\textsc{SWFA-Backward}: full expanded reference.}
     \label{alg:appendix_backward}
     \KwIn{$Q, K, V$; saved $(m_r, \ell_r, O_r)$ for every $r$;
