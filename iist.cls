@@ -105,9 +105,7 @@
 %% ---- Content Styles ---- %%
 \onehalfspacing   % Line spacing
 \hypersetup{ % Hyperlink set up
-    linkbordercolor = blue!30,
-    citebordercolor = lime!70,
-    urlbordercolor = red!50,
+  hidelinks,
 }
 \titleformat{\chapter}[display]{\LARGE\bfseries}{\chaptertitlename\ 
 \thechapter}{1mm}{\huge} % Chapter title 
